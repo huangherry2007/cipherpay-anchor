@@ -1,0 +1,18 @@
+---
+description: 
+globs: *.circom
+alwaysApply: false
+---
+---
+description: Guidelines for Circom circuit development
+globs: ["circuits/**/*.circom"]
+alwaysApply: false
+---
+
+- Utilize standard Circom libraries such as `circomlib` for common components.
+- Structure circuits with clear inputs, outputs, and constraints.
+- Follow naming conventions: use camelCase for signals and PascalCase for component names.
+- Include comments to explain complex constraints and logic.
+- Ensure circuits are modular and reusable where possible.
+
+@templates/circuit-template.circom
