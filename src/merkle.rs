@@ -11,6 +11,7 @@ pub enum MerkleError {
     NullifierAlreadyUsed,
 }
 
+#[allow(dead_code)]
 /// Verifies a merkle proof against a root
 pub fn verify_merkle_proof(proof: &Vec<[u8; 32]>, root: [u8; 32]) -> Result<()> {
     if proof.is_empty() {
@@ -28,6 +29,7 @@ pub fn verify_merkle_proof(proof: &Vec<[u8; 32]>, root: [u8; 32]) -> Result<()> 
     Ok(())
 }
 
+#[allow(dead_code)]
 /// Calculates the merkle root from a proof
 pub fn calculate_merkle_root(proof: &Vec<[u8; 32]>) -> Result<[u8; 32]> {
     let mut current = proof[0];
@@ -50,6 +52,7 @@ pub fn calculate_merkle_root(proof: &Vec<[u8; 32]>) -> Result<[u8; 32]> {
     Ok(current)
 }
 
+#[allow(dead_code)]
 /// Verifies if a leaf is in the merkle tree
 pub fn verify_leaf_in_tree(leaf: [u8; 32], proof: &Vec<[u8; 32]>, root: [u8; 32]) -> Result<bool> {
     let mut current = leaf;
@@ -72,6 +75,7 @@ pub fn verify_leaf_in_tree(leaf: [u8; 32], proof: &Vec<[u8; 32]>, root: [u8; 32]
     Ok(current == root)
 }
 
+#[allow(dead_code)]
 /// Verifies if a nullifier has been used
 pub fn verify_nullifier(nullifier: [u8; 32], nullifier_set: &Vec<[u8; 32]>) -> Result<bool> {
     // Check if nullifier is already used

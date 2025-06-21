@@ -13,11 +13,31 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 default = []
+real-crypto = [
+    "ark-bn254",
+    "ark-ff", 
+    "ark-ec",
+    "ark-std",
+    "ark-serialize",
+    "ark-groth16",
+    "ark-relations",
+    "ark-crypto-primitives"
+]
 
 [dependencies]
-anchor-lang = "0.28.0"
-anchor-spl = "0.28.0"
-solana-program = "1.16.0"
+anchor-lang = "0.29.0"
+anchor-spl = "0.29.0"
+solana-program = "2.3.0"
 thiserror = "1.0"
 bytemuck = { version = "1.13", features = ["derive"] }
-sha2 = "0.10.8" 
+sha2 = "0.10.8"
+lazy_static = "1.4"
+# Cryptographic dependencies for real Groth16 implementation
+ark-bn254 = { version = "0.5.0-alpha.0", optional = true }
+ark-ff = { version = "0.4.0", optional = true }
+ark-ec = { version = "0.4.0", optional = true }
+ark-std = { version = "0.4.0", optional = true }
+ark-serialize = { version = "0.4.0", optional = true }
+ark-groth16 = { version = "0.4.0", optional = true }
+ark-relations = { version = "0.4.0", optional = true }
+ark-crypto-primitives = { version = "0.4.0", optional = true } 

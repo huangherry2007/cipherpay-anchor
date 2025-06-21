@@ -1,5 +1,7 @@
-use anchor_lang::prelude::*;
+// Remove unused import
+// use anchor_lang::prelude::*;
 
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct ValidationLimits {
     pub max_stream_amount: u64,
@@ -9,14 +11,15 @@ pub struct ValidationLimits {
     pub max_public_inputs: usize,
 }
 
+#[allow(dead_code)]
 impl ValidationLimits {
     pub fn new() -> Self {
         Self {
-            max_stream_amount: 1_000_000_000, // 1 SOL
-            max_stream_duration: 31_536_000, // 1 year in seconds
+            max_stream_amount: 1_000_000_000, // 1 billion lamports
+            max_stream_duration: 365 * 24 * 60 * 60, // 1 year in seconds
             max_recipients: 10,
             max_proof_size: 1024,
-            max_public_inputs: 1000,
+            max_public_inputs: 100,
         }
     }
 

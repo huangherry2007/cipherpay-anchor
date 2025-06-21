@@ -15,9 +15,21 @@ pub enum CipherPayError {
     #[msg("Insufficient compute budget")]
     InsufficientComputeBudget,
 
+    /// Insufficient compute units
+    #[msg("Insufficient compute units")]
+    InsufficientComputeUnits,
+
     /// Invalid merkle root
     #[msg("Invalid merkle root")]
     InvalidMerkleRoot,
+
+    /// Invalid merkle proof
+    #[msg("Invalid merkle proof")]
+    InvalidMerkleProof,
+
+    /// Invalid nullifier
+    #[msg("Invalid nullifier")]
+    InvalidNullifier,
 
     /// Arithmetic overflow
     #[msg("Arithmetic overflow")]
@@ -70,6 +82,62 @@ pub enum CipherPayError {
     /// Invalid compute budget
     #[msg("Invalid compute budget")]
     InvalidComputeBudget,
+
+    /// Unsupported circuit type
+    #[msg("Unsupported circuit type")]
+    UnsupportedCircuit,
+
+    /// Invalid public inputs
+    #[msg("Invalid public inputs")]
+    InvalidPublicInputs,
+
+    /// Invalid curve point
+    #[msg("Invalid curve point")]
+    InvalidCurvePoint,
+
+    /// Pairing verification failed
+    #[msg("Pairing verification failed")]
+    PairingVerificationFailed,
+
+    /// Invalid audit proof
+    #[msg("Invalid audit proof")]
+    InvalidAuditProof,
+
+    /// Invalid condition proof
+    #[msg("Invalid condition proof")]
+    InvalidConditionProof,
+
+    /// Invalid stream proof
+    #[msg("Invalid stream proof")]
+    InvalidStreamProof,
+
+    /// Invalid split proof
+    #[msg("Invalid split proof")]
+    InvalidSplitProof,
+
+    /// Invalid transfer proof
+    #[msg("Invalid transfer proof")]
+    InvalidTransferProof,
+
+    /// Invalid withdraw proof
+    #[msg("Invalid withdraw proof")]
+    InvalidWithdrawProof,
+
+    /// State verification failed
+    #[msg("State verification failed")]
+    StateVerificationFailed,
+
+    /// Authority verification failed
+    #[msg("Authority verification failed")]
+    AuthorityVerificationFailed,
+
+    /// Vault not initialized
+    #[msg("Vault not initialized")]
+    VaultNotInitialized,
+
+    /// Verifier not initialized
+    #[msg("Verifier not initialized")]
+    VerifierNotInitialized,
 }
 
 #[cfg(test)]
@@ -83,7 +151,10 @@ mod tests {
             CipherPayError::InvalidProofFormat,
             CipherPayError::ProofVerificationFailed,
             CipherPayError::InsufficientComputeBudget,
+            CipherPayError::InsufficientComputeUnits,
             CipherPayError::InvalidMerkleRoot,
+            CipherPayError::InvalidMerkleProof,
+            CipherPayError::InvalidNullifier,
             CipherPayError::ArithmeticOverflow,
             CipherPayError::InvalidStreamParams,
             CipherPayError::StreamExpired,
@@ -97,6 +168,20 @@ mod tests {
             CipherPayError::InvalidSplitParams,
             CipherPayError::ZeroAmount,
             CipherPayError::InvalidComputeBudget,
+            CipherPayError::UnsupportedCircuit,
+            CipherPayError::InvalidPublicInputs,
+            CipherPayError::InvalidCurvePoint,
+            CipherPayError::PairingVerificationFailed,
+            CipherPayError::InvalidAuditProof,
+            CipherPayError::InvalidConditionProof,
+            CipherPayError::InvalidStreamProof,
+            CipherPayError::InvalidSplitProof,
+            CipherPayError::InvalidTransferProof,
+            CipherPayError::InvalidWithdrawProof,
+            CipherPayError::StateVerificationFailed,
+            CipherPayError::AuthorityVerificationFailed,
+            CipherPayError::VaultNotInitialized,
+            CipherPayError::VerifierNotInitialized,
         ];
 
         for error in errors {
