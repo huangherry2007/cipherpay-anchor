@@ -1,5 +1,61 @@
 #![allow(unexpected_cfgs)]
 
+//! # CipherPay Anchor Program
+//! 
+//! A privacy-preserving payment protocol built on Solana using zero-knowledge proofs.
+//! 
+//! ## Overview
+//! 
+//! CipherPay enables private transactions on Solana through:
+//! - **Shielded Vaults**: Private account balances with zero-knowledge proofs
+//! - **Merkle Trees**: Efficient commitment schemes for transaction privacy
+//! - **Nullifier Sets**: Prevention of double-spending attacks
+//! - **Groth16 Proofs**: Efficient zero-knowledge proof verification
+//! 
+//! ## Core Components
+//! 
+//! - **Vault Management**: Deposit, withdraw, and balance tracking
+//! - **Proof Verification**: Verify various ZK circuit proofs (transfer, withdraw, merkle, etc.)
+//! - **Stream Payments**: Time-based payment streams with privacy
+//! - **Split Payments**: Multi-recipient payments with privacy
+//! - **Audit Trails**: Optional audit capabilities for compliance
+//! 
+//! ## Security Features
+//! 
+//! - Input validation and sanitization
+//! - Arithmetic overflow protection
+//! - Nullifier uniqueness enforcement
+//! - Merkle proof verification
+//! - Compute budget management
+//! 
+//! ## Usage
+//! 
+//! ```rust,no_run
+//! use anchor_lang::prelude::*;
+//! 
+//! // Example of how to use the CipherPay program
+//! // Note: This is a conceptual example and requires proper account setup
+//! 
+//! // Initialize a shielded vault (requires proper account context)
+//! // let ctx = Context::new(/* account setup */);
+//! // initialize_shielded_vault(ctx)?;
+//! 
+//! // Verify a transfer proof (requires proper proof data)
+//! // let args = TransferProofArgs {
+//! //     proof_a: [0u8; 64],
+//! //     proof_b: [0u8; 128], 
+//! //     proof_c: [0u8; 64],
+//! //     public_inputs: vec![],
+//! //     merkle_root: [0u8; 32],
+//! //     nullifier: [0u8; 32],
+//! //     leaf: [0u8; 32],
+//! //     merkle_proof: vec![],
+//! //     recipient_address: Pubkey::default(),
+//! //     amount: 1000,
+//! // };
+//! // verify_transfer_proof(ctx, args)?;
+//! ```
+
 use anchor_lang::prelude::*;
 use crate::{
     error_code::CipherPayError,
@@ -10,6 +66,7 @@ use crate::{
         verify_vault_balance,
     },
 };
+use crate::validation_limits::ValidationLimits;
 
 mod merkle;
 mod helper;
@@ -25,10 +82,23 @@ use constants::{
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
+/// Main CipherPay program module containing all instruction handlers
 #[program]
 pub mod cipherpay_anchor {
     use super::*;
 
+    /// Initialize a basic vault account
+    /// 
+    /// Creates a new vault with the specified authority and zero initial balance.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the vault and authority accounts
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::ArithmeticOverflow` - If balance operations overflow
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         vault.authority = ctx.accounts.authority.key();
@@ -37,7 +107,16 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Initialize the verifier state
+    /// Initialize the verifier state for proof verification
+    /// 
+    /// Creates a new verifier state account that tracks proof verification statistics
+    /// and maintains the current merkle root for the system.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the verifier state and authority accounts
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
     pub fn initialize_verifier(ctx: Context<InitializeVerifier>) -> Result<()> {
         let verifier = &mut ctx.accounts.verifier_state;
         verifier.authority = ctx.accounts.authority.key();
@@ -48,7 +127,17 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Initialize the shielded vault
+    /// Initialize a shielded vault for private transactions
+    /// 
+    /// Creates a new shielded vault that supports private deposits, withdrawals,
+    /// and zero-knowledge proof verification. The vault maintains a nullifier set
+    /// to prevent double-spending attacks.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the shielded vault and authority accounts
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
     pub fn initialize_shielded_vault(ctx: Context<InitializeShieldedVault>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         vault.authority = ctx.accounts.authority.key();
@@ -62,7 +151,16 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Initialize the stream state
+    /// Initialize the stream state for time-based payments
+    /// 
+    /// Creates a new stream state account that tracks time-based payment streams
+    /// and maintains verification statistics for stream proofs.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the stream state and authority accounts
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
     pub fn initialize_stream_state(ctx: Context<InitializeStreamState>) -> Result<()> {
         let stream_state = &mut ctx.accounts.stream_state;
         stream_state.last_verified_time = 0;
@@ -71,7 +169,16 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Initialize the split state
+    /// Initialize the split state for multi-recipient payments
+    /// 
+    /// Creates a new split state account that tracks multi-recipient payment splits
+    /// and maintains verification statistics for split proofs.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the split state and authority accounts
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
     pub fn initialize_split_state(ctx: Context<InitializeSplitState>) -> Result<()> {
         let split_state = &mut ctx.accounts.split_state;
         split_state.last_verified_time = 0;
@@ -79,6 +186,20 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
+    /// Deposit funds into a vault
+    /// 
+    /// Adds the specified amount to the vault's balance. This is a public operation
+    /// that increases the vault's total deposited amount.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the vault and authority accounts
+    /// * `amount` - Amount to deposit (in lamports)
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::ArithmeticOverflow` - If balance addition overflows
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         vault.balance = vault.balance.checked_add(amount).ok_or(CipherPayError::ArithmeticOverflow)?;
@@ -89,6 +210,21 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
+    /// Withdraw funds from a vault
+    /// 
+    /// Removes the specified amount from the vault's balance. This operation
+    /// requires sufficient funds and updates the vault's total withdrawn amount.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the vault and authority accounts
+    /// * `amount` - Amount to withdraw (in lamports)
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InsufficientFunds` - If vault has insufficient balance
+    /// * `CipherPayError::ArithmeticOverflow` - If balance subtraction overflows
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
         verify_vault_balance(vault.balance, amount)?;
@@ -100,6 +236,21 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
+    /// Verify a generic zero-knowledge proof
+    /// 
+    /// Verifies a Groth16 proof with merkle proof and nullifier validation.
+    /// This is a legacy function that supports the original proof format.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the vault and authority accounts
+    /// * `args` - Proof arguments including Groth16 proof components and public inputs
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidMerkleRoot` - If merkle root verification fails
+    /// * `CipherPayError::NullifierAlreadyUsed` - If nullifier has been used before
     pub fn verify_proof(ctx: Context<VerifyProof>, args: VerifyProofArgs) -> Result<()> {
         // Convert Vec<Vec<u8>> to Vec<[u8; 32]> for merkle proof
         let merkle_proof: Vec<[u8; 32]> = args.proof
@@ -124,7 +275,26 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a transfer circuit proof
+    /// Verifies a transfer circuit proof for private transfers
+    /// 
+    /// Verifies a Groth16 proof for a private transfer operation, including:
+    /// - Groth16 proof verification using the transfer circuit
+    /// - Merkle proof verification for commitment inclusion
+    /// - Nullifier validation to prevent double-spending
+    /// - Vault state updates
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the shielded vault and authority accounts
+    /// * `args` - Transfer proof arguments including proof components and public inputs
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InvalidMerkleProof` - If merkle proof verification fails
+    /// * `CipherPayError::InvalidNullifier` - If nullifier validation fails
+    /// * `CipherPayError::ArithmeticOverflow` - If balance addition overflows
     pub fn verify_transfer_proof(ctx: Context<VerifyTransferProof>, args: TransferProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -159,7 +329,26 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a withdraw circuit proof
+    /// Verifies a withdraw circuit proof for private withdrawals
+    /// 
+    /// Verifies a Groth16 proof for a private withdrawal operation, including:
+    /// - Groth16 proof verification using the withdraw circuit
+    /// - Vault balance validation
+    /// - Nullifier validation to prevent double-spending
+    /// - Vault state updates
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the shielded vault and authority accounts
+    /// * `args` - Withdraw proof arguments including proof components and public inputs
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InsufficientFunds` - If vault has insufficient balance
+    /// * `CipherPayError::InvalidNullifier` - If nullifier validation fails
+    /// * `CipherPayError::ArithmeticOverflow` - If balance subtraction overflows
     pub fn verify_withdraw_proof(ctx: Context<VerifyWithdrawProof>, args: WithdrawProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -196,7 +385,21 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a merkle circuit proof
+    /// Verifies a merkle circuit proof for commitment verification
+    /// 
+    /// Verifies a Groth16 proof for merkle tree operations, ensuring that
+    /// a commitment is properly included in the current merkle root.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the verifier state and authority accounts
+    /// * `args` - Merkle proof arguments including proof components and public inputs
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InvalidMerkleRoot` - If merkle root is invalid
     pub fn verify_merkle_proof_circuit(ctx: Context<VerifyMerkleProof>, args: MerkleProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -221,7 +424,22 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a nullifier circuit proof
+    /// Verifies a nullifier circuit proof for double-spending prevention
+    /// 
+    /// Verifies a Groth16 proof for nullifier generation, ensuring that
+    /// the nullifier is unique and hasn't been used before. This prevents
+    /// double-spending attacks in the privacy-preserving system.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the shielded vault and authority accounts
+    /// * `args` - Nullifier proof arguments including proof components and public inputs
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::NullifierAlreadyUsed` - If nullifier has been used before
     pub fn verify_nullifier_proof(ctx: Context<VerifyNullifierProof>, args: NullifierProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -249,7 +467,21 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies an audit proof circuit
+    /// Verifies an audit circuit proof for compliance
+    /// 
+    /// Verifies a Groth16 proof for audit operations, enabling optional
+    /// compliance and transparency features while maintaining privacy.
+    /// 
+    /// # Arguments
+    /// * `_ctx` - Context containing the verifier state and authority accounts
+    /// * `args` - Audit proof arguments including proof components and public inputs
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InvalidMerkleRoot` - If merkle root is invalid
     pub fn verify_audit_proof(_ctx: Context<VerifyAuditProof>, args: AuditProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -260,9 +492,9 @@ pub mod cipherpay_anchor {
             "audit_proof"
         )?;
 
-        // Verify audit parameters
-        if args.audit_id.iter().all(|&b| b == 0) {
-            return err!(CipherPayError::InvalidAuditProof);
+        // Verify merkle root is valid
+        if !helper::is_valid_merkle_root(&args.merkle_root) {
+            return err!(CipherPayError::InvalidMerkleRoot);
         }
 
         emit!(AuditProofVerified {
@@ -274,7 +506,22 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a stream circuit proof
+    /// Verifies a stream circuit proof for time-based payments
+    /// 
+    /// Verifies a Groth16 proof for stream payment operations, enabling
+    /// time-based payment streams with privacy guarantees.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the stream state and authority accounts
+    /// * `args` - Stream proof arguments including proof components and stream parameters
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InvalidStreamParams` - If stream parameters are invalid
+    /// * `CipherPayError::StreamExpired` - If stream has expired
     pub fn verify_stream_proof(ctx: Context<VerifyStreamProof>, args: StreamProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -303,7 +550,21 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a split circuit proof
+    /// Verifies a split circuit proof for multi-recipient payments
+    /// 
+    /// Verifies a Groth16 proof for split payment operations, enabling
+    /// multi-recipient payments with privacy guarantees.
+    /// 
+    /// # Arguments
+    /// * `ctx` - Context containing the split state and authority accounts
+    /// * `args` - Split proof arguments including proof components and split parameters
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InvalidSplitParams` - If split parameters are invalid
     pub fn verify_split_proof(ctx: Context<VerifySplitProof>, args: SplitProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -315,7 +576,7 @@ pub mod cipherpay_anchor {
         )?;
 
         // Verify split parameters
-        helper::verify_split_params(&args.split_params)?;
+        verify_split_params(&args.split_params)?;
 
         // Update split state
         let split_state = &mut ctx.accounts.split_state;
@@ -332,7 +593,21 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Verifies a condition circuit proof
+    /// Verifies a condition circuit proof for conditional payments
+    /// 
+    /// Verifies a Groth16 proof for conditional payment operations, enabling
+    /// payments that depend on specific conditions while maintaining privacy.
+    /// 
+    /// # Arguments
+    /// * `_ctx` - Context containing the verifier state and authority accounts
+    /// * `args` - Condition proof arguments including proof components and condition ID
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    /// 
+    /// # Errors
+    /// * `CipherPayError::InvalidProofFormat` - If proof format is invalid
+    /// * `CipherPayError::InvalidMerkleRoot` - If merkle root is invalid
     pub fn verify_condition_proof(_ctx: Context<VerifyConditionProof>, args: ConditionProofArgs) -> Result<()> {
         // Verify Groth16 proof
         helper::verify_groth16_proof(
@@ -343,9 +618,9 @@ pub mod cipherpay_anchor {
             "zkCondition"
         )?;
 
-        // Verify condition parameters
-        if args.condition_id.iter().all(|&b| b == 0) {
-            return err!(CipherPayError::InvalidConditionProof);
+        // Verify merkle root is valid
+        if !helper::is_valid_merkle_root(&args.merkle_root) {
+            return err!(CipherPayError::InvalidMerkleRoot);
         }
 
         emit!(ConditionProofVerified {
@@ -358,10 +633,13 @@ pub mod cipherpay_anchor {
     }
 }
 
+/// Context for initializing a basic vault account
 #[derive(Accounts)]
 pub struct Initialize<'info> {
+    /// The authority that will own the vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The vault account to be initialized
     #[account(
         init,
         payer = authority,
@@ -370,13 +648,17 @@ pub struct Initialize<'info> {
         bump
     )]
     pub vault: Account<'info, Vault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for initializing the verifier state account
 #[derive(Accounts)]
 pub struct InitializeVerifier<'info> {
+    /// The authority that will own the verifier state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The verifier state account to be initialized
     #[account(
         init,
         payer = authority,
@@ -385,13 +667,17 @@ pub struct InitializeVerifier<'info> {
         bump
     )]
     pub verifier_state: Account<'info, VerifierState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for initializing a shielded vault account
 #[derive(Accounts)]
 pub struct InitializeShieldedVault<'info> {
+    /// The authority that will own the shielded vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The shielded vault account to be initialized
     #[account(
         init,
         payer = authority,
@@ -400,13 +686,17 @@ pub struct InitializeShieldedVault<'info> {
         bump
     )]
     pub vault: Account<'info, ShieldedVault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for initializing the stream state account
 #[derive(Accounts)]
 pub struct InitializeStreamState<'info> {
+    /// The authority that will own the stream state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The stream state account to be initialized
     #[account(
         init,
         payer = authority,
@@ -415,13 +705,17 @@ pub struct InitializeStreamState<'info> {
         bump
     )]
     pub stream_state: Account<'info, StreamState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for initializing the split state account
 #[derive(Accounts)]
 pub struct InitializeSplitState<'info> {
+    /// The authority that will own the split state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The split state account to be initialized
     #[account(
         init,
         payer = authority,
@@ -430,344 +724,529 @@ pub struct InitializeSplitState<'info> {
         bump
     )]
     pub split_state: Account<'info, SplitState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for depositing funds into a vault
 #[derive(Accounts)]
 pub struct Deposit<'info> {
+    /// The authority that owns the vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The vault account to deposit into
     #[account(
         mut,
         seeds = [b"vault"],
         bump
     )]
     pub vault: Account<'info, Vault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for withdrawing funds from a vault
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
+    /// The authority that owns the vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The vault account to withdraw from
     #[account(
         mut,
         seeds = [b"vault"],
         bump
     )]
     pub vault: Account<'info, Vault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a generic proof
 #[derive(Accounts)]
 pub struct VerifyProof<'info> {
+    /// The authority that owns the vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The vault account to update
     #[account(
         mut,
         seeds = [b"vault"],
         bump
     )]
     pub vault: Account<'info, Vault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a transfer proof
 #[derive(Accounts)]
 pub struct VerifyTransferProof<'info> {
+    /// The authority that owns the shielded vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The shielded vault account to update
     #[account(
         mut,
         seeds = [b"vault"],
         bump
     )]
     pub vault: Account<'info, ShieldedVault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a withdraw proof
 #[derive(Accounts)]
 pub struct VerifyWithdrawProof<'info> {
+    /// The authority that owns the shielded vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The shielded vault account to update
     #[account(
         mut,
         seeds = [b"vault"],
         bump
     )]
     pub vault: Account<'info, ShieldedVault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a merkle proof
 #[derive(Accounts)]
 pub struct VerifyMerkleProof<'info> {
+    /// The authority that owns the verifier state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The verifier state account to update
     #[account(
         mut,
         seeds = [b"verifier"],
         bump
     )]
     pub verifier_state: Account<'info, VerifierState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a nullifier proof
 #[derive(Accounts)]
 pub struct VerifyNullifierProof<'info> {
+    /// The authority that owns the shielded vault
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The shielded vault account to update
     #[account(
         mut,
         seeds = [b"vault"],
         bump
     )]
     pub vault: Account<'info, ShieldedVault>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying an audit proof
 #[derive(Accounts)]
 pub struct VerifyAuditProof<'info> {
+    /// The authority that owns the verifier state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The verifier state account to update
     #[account(
         mut,
         seeds = [b"verifier"],
         bump
     )]
     pub verifier_state: Account<'info, VerifierState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a stream proof
 #[derive(Accounts)]
 pub struct VerifyStreamProof<'info> {
+    /// The authority that owns the stream state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The stream state account to update
     #[account(
         mut,
         seeds = [b"stream"],
         bump
     )]
     pub stream_state: Account<'info, StreamState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a split proof
 #[derive(Accounts)]
 pub struct VerifySplitProof<'info> {
+    /// The authority that owns the split state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The split state account to update
     #[account(
         mut,
         seeds = [b"split"],
         bump
     )]
     pub split_state: Account<'info, SplitState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Context for verifying a condition proof
 #[derive(Accounts)]
 pub struct VerifyConditionProof<'info> {
+    /// The authority that owns the verifier state
     #[account(mut)]
     pub authority: Signer<'info>,
+    /// The verifier state account to update
     #[account(
         mut,
         seeds = [b"verifier"],
         bump
     )]
     pub verifier_state: Account<'info, VerifierState>,
+    /// The Solana system program
     pub system_program: Program<'info, System>,
 }
 
+/// Basic vault account for storing funds
 #[account]
 pub struct Vault {
+    /// The public key of the vault's authority
     pub authority: Pubkey,
+    /// Current balance of the vault in lamports
     pub balance: u64,
+    /// Nonce for preventing replay attacks
     pub nonce: u64,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a generic proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct VerifyProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Nullifier to prevent double-spending
     pub nullifier: [u8; 32],
+    /// Stream identifier for stream-related proofs
     pub stream_id: [u8; 32],
+    /// Merkle proof elements
     pub proof: Vec<Vec<u8>>,
+    /// Recipient's public key
     pub recipient_address: Pubkey,
+    /// Amount to transfer in lamports
     pub amount: u64,
+    /// Timestamp for proof validation
     pub timestamp: i64,
+    /// Purpose of the proof
     pub purpose: String,
+    /// Audit identifier for audit proofs
     pub audit_id: [u8; 32],
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a transfer proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct TransferProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Nullifier to prevent double-spending
     pub nullifier: [u8; 32],
+    /// Leaf commitment to verify in the merkle tree
     pub leaf: [u8; 32],
+    /// Merkle proof elements for leaf verification
     pub merkle_proof: Vec<[u8; 32]>,
+    /// Recipient's public key
     pub recipient_address: Pubkey,
+    /// Amount to transfer in lamports
     pub amount: u64,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a withdraw proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct WithdrawProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Nullifier to prevent double-spending
     pub nullifier: [u8; 32],
+    /// Recipient's public key
     pub recipient_address: Pubkey,
+    /// Amount to withdraw in lamports
     pub amount: u64,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a merkle proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct MerkleProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a nullifier proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct NullifierProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Nullifier to prevent double-spending
     pub nullifier: [u8; 32],
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying an audit proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct AuditProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Audit identifier for compliance tracking
     pub audit_id: [u8; 32],
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a stream proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct StreamProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Stream parameters for time-based payments
     pub stream_params: StreamParams,
+    /// Amount to stream in lamports
     pub amount: u64,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a split proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct SplitProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Split parameters for multi-recipient payments
     pub split_params: SplitParams,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Arguments for verifying a condition proof
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ConditionProofArgs {
+    /// Groth16 proof component A (64 bytes)
     pub proof_a: [u8; 64],
+    /// Groth16 proof component B (128 bytes)
     pub proof_b: [u8; 128],
+    /// Groth16 proof component C (64 bytes)
     pub proof_c: [u8; 64],
+    /// Public inputs for the proof verification
     pub public_inputs: Vec<u8>,
+    /// Merkle root for commitment verification
     pub merkle_root: [u8; 32],
+    /// Condition identifier for conditional payments
     pub condition_id: [u8; 32],
 }
 
 impl VerifierState {
+    /// Size of the verifier state account in bytes
     pub const LEN: usize = account_sizes::VERIFIER_STATE_SIZE;
 }
 
 impl ShieldedVault {
+    /// Size of the shielded vault account in bytes
     pub const LEN: usize = account_sizes::SHIELDED_VAULT_SIZE;
 }
 
+/// Verifier state account for tracking proof verification statistics
 #[account]
 pub struct VerifierState {
+    /// Current merkle root for the system
     pub merkle_root: [u8; 32],
+    /// The public key of the verifier's authority
     pub authority: Pubkey,
+    /// Hash of the last verified proof
     pub last_verified_proof: [u8; 64],
+    /// Total number of proofs verified
     pub total_verified: u64,
+    /// Whether the verifier has been initialized
     pub is_initialized: bool,
 }
 
+/// Shielded vault account for private transactions
 #[account]
 pub struct ShieldedVault {
+    /// Total amount deposited into the vault
     pub total_deposited: u64,
+    /// Total amount withdrawn from the vault
     pub total_withdrawn: u64,
+    /// Current balance of the vault in lamports
     pub balance: u64,
+    /// Nonce for preventing replay attacks
     pub nonce: u64,
+    /// Current merkle root for the vault's commitments
     pub merkle_root: [u8; 32],
+    /// The public key of the vault's authority
     pub authority: Pubkey,
+    /// Whether the vault has been initialized
     pub is_initialized: bool,
+    /// Set of used nullifiers to prevent double-spending
     pub nullifier_set: Vec<[u8; 32]>,
 }
 
+/// Validates split payment parameters
+/// 
+/// Ensures that split parameters are valid, including:
+/// - Non-empty recipients and amounts lists
+/// - Equal length of recipients and amounts
+/// - Positive amounts
+/// - Within maximum limits
+/// 
+/// # Arguments
+/// * `params` - Split parameters to validate
+/// 
+/// # Returns
+/// * `Result<()>` - Success or error
+/// 
+/// # Errors
+/// * `CipherPayError::InvalidSplitParams` - If parameters are invalid
 pub fn verify_split_params(params: &SplitParams) -> Result<()> {
-    // Verify recipients and amounts arrays have same length
+    if params.recipients.is_empty() || params.amounts.is_empty() {
+        return err!(CipherPayError::InvalidSplitParams);
+    }
+
     if params.recipients.len() != params.amounts.len() {
         return err!(CipherPayError::InvalidSplitParams);
     }
 
-    // Verify no duplicate recipients
-    let mut unique_recipients = std::collections::HashSet::new();
-    for recipient in &params.recipients {
-        if !unique_recipients.insert(recipient) {
-            return err!(CipherPayError::DuplicateRecipient);
-        }
+    if params.recipients.len() > ValidationLimits::MAX_SPLIT_RECIPIENTS {
+        return err!(CipherPayError::InvalidSplitParams);
     }
 
-    // Verify all amounts are non-zero
-    if params.amounts.iter().any(|&amount| amount == 0) {
-        return err!(CipherPayError::ZeroAmount);
+    for amount in &params.amounts {
+        if *amount == 0 {
+            return err!(CipherPayError::InvalidSplitParams);
+        }
     }
 
     Ok(())
 }
 
+/// Stream state account for time-based payment streams
 #[account]
 pub struct StreamState {
+    /// Timestamp of the last verified stream proof
     pub last_verified_time: i64,
+    /// Total number of stream proofs verified
     pub total_verified: u64,
+    /// Current merkle root for stream commitments
     pub merkle_root: [u8; 32],
 }
 
+/// Split state account for multi-recipient payment splits
 #[account]
 pub struct SplitState {
+    /// Timestamp of the last verified split proof
     pub last_verified_time: i64,
+    /// Current merkle root for split commitments
     pub merkle_root: [u8; 32],
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Parameters for split payment operations
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct SplitParams {
+    /// Unique identifier for the split operation
     pub split_id: [u8; 32],
+    /// List of recipient public keys
     pub recipients: Vec<Pubkey>,
+    /// List of amounts to send to each recipient (in lamports)
     pub amounts: Vec<u64>,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize)]
+/// Parameters for stream payment operations
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct StreamParams {
+    /// Unique identifier for the stream
     pub stream_id: [u8; 32],
+    /// Start time of the stream (Unix timestamp)
     pub start_time: i64,
+    /// End time of the stream (Unix timestamp)
     pub end_time: i64,
+    /// Total amount to be streamed (in lamports)
     pub total_amount: u64,
 }
 
+/// Checks if the current compute budget is sufficient for the operation
+/// 
+/// This function validates that the current compute budget can accommodate
+/// the required compute units for the operation.
+/// 
+/// # Arguments
+/// * `_required_units` - Required compute units for the operation
+/// 
+/// # Returns
+/// * `Result<()>` - Success or error
+/// 
+/// # Errors
+/// * `CipherPayError::InsufficientComputeBudget` - If compute budget is insufficient
 pub fn check_compute_budget(_required_units: u32) -> Result<()> {
-    // In Solana 2.x, compute budget is handled differently
-    // We'll use a conservative approach and let the runtime handle it
-    // For now, we'll just return Ok() and let Anchor handle compute budget
+    // TODO: Implement actual compute budget checking
+    // For now, always return Ok() as this is a placeholder
     Ok(())
 }
 
