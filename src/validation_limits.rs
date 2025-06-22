@@ -13,6 +13,9 @@ pub struct ValidationLimits {
 
 #[allow(dead_code)]
 impl ValidationLimits {
+    pub const MAX_NULLIFIER_SET_SIZE: usize = 1000;
+    pub const MAX_SPLIT_RECIPIENTS: usize = 10;
+    
     pub fn new() -> Self {
         Self {
             max_stream_amount: 1_000_000_000, // 1 billion lamports
@@ -42,4 +45,20 @@ impl ValidationLimits {
     pub fn verify_public_inputs_count(&self, count: usize) -> bool {
         count <= self.max_public_inputs
     }
+}
+
+#[allow(dead_code)]
+pub struct StreamVerification;
+
+#[allow(dead_code)]
+impl StreamVerification {
+    pub const REQUIRED_UNITS: u32 = 200_000;
+}
+
+#[allow(dead_code)]
+pub struct SplitVerification;
+
+#[allow(dead_code)]
+impl SplitVerification {
+    pub const REQUIRED_UNITS: u32 = 150_000;
 } 

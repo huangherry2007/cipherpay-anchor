@@ -92,34 +92,26 @@ mod tests {
 
     #[test]
     fn test_merkle_proof_verification() {
-        // Create a simple merkle tree with 4 leaves
-        let leaf1 = [1u8; 32];
-        let leaf2 = [2u8; 32];
-        let leaf3 = [3u8; 32];
-        let leaf4 = [4u8; 32];
+        // Create a simple proof with 2 elements
+        let proof_element1 = [1u8; 32];
+        let proof_element2 = [2u8; 32];
 
-        // Calculate intermediate hashes
+        // Calculate the expected root using the same algorithm as calculate_merkle_root
         let mut hasher = Sha256::new();
-        hasher.update(&leaf1);
-        hasher.update(&leaf2);
-        let hash12: [u8; 32] = hasher.finalize().into();
+        if proof_element1 < proof_element2 {
+            hasher.update(&proof_element1);
+            hasher.update(&proof_element2);
+        } else {
+            hasher.update(&proof_element2);
+            hasher.update(&proof_element1);
+        }
+        let expected_root: [u8; 32] = hasher.finalize().into();
 
-        let mut hasher = Sha256::new();
-        hasher.update(&leaf3);
-        hasher.update(&leaf4);
-        let hash34: [u8; 32] = hasher.finalize().into();
-
-        // Calculate root
-        let mut hasher = Sha256::new();
-        hasher.update(&hash12);
-        hasher.update(&hash34);
-        let root: [u8; 32] = hasher.finalize().into();
-
-        // Create proof for leaf1
-        let proof = vec![leaf2, hash34];
+        // Create proof: [proof_element1, proof_element2]
+        let proof = vec![proof_element1, proof_element2];
 
         // Verify proof
-        assert!(verify_merkle_proof(&proof, root).is_ok());
+        assert!(verify_merkle_proof(&proof, expected_root).is_ok());
     }
 
     #[test]

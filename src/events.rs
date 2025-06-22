@@ -133,19 +133,19 @@ mod tests {
         assert_eq!(event.stream_id, [255; 32]);
         assert_eq!(event.timestamp, i64::MAX);
 
-        // Test with current timestamp
-        let current_time = Clock::get().unwrap().unix_timestamp;
+        // Test with mock timestamp
+        let mock_time = 1234567890;
         let event = ProofVerified {
             stream_id: [42; 32],
-            timestamp: current_time,
+            timestamp: mock_time,
         };
         assert_eq!(event.stream_id, [42; 32]);
-        assert!(event.timestamp <= current_time);
+        assert_eq!(event.timestamp, mock_time);
     }
 
     #[test]
     fn test_vault_events() {
-        let base_time = Clock::get().unwrap().unix_timestamp;
+        let base_time = 1234567890;
         
         // Test deposit event
         let deposit_event = VaultDeposited {
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_circuit_verification_events() {
-        let base_time = Clock::get().unwrap().unix_timestamp;
+        let base_time = 1234567890;
         let test_pubkey = Pubkey::new_unique();
         
         // Test transfer proof event
