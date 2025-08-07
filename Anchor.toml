@@ -9,8 +9,17 @@ cipherpay_anchor = "XeEs3gHZGdDhs3Lm1VoukrWrEnjdC3CA5VRtowN5MGz"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts" 
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[workspace]
+members = [
+  "programs/cipherpay-anchor"
+]
+
+[build]
+# Optional: Include the path to your zk_verifier constants if you want them rebuilt automatically
+# rustflags = ["--cfg", "zk_mode"]
