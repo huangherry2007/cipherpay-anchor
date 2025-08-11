@@ -1,7 +1,5 @@
 use anchor_lang::prelude::*;
 
-declare_id!("11111111111111111111111111111111");
-
 pub const MAX_ROOTS: usize = 1024;
 
 #[account]
@@ -20,6 +18,7 @@ pub struct MerkleRootCache {
 }
 
 impl MerkleRootCache {
+    pub const SIZE: usize = 4 + (MAX_ROOTS * 32);
     pub fn insert_root(&mut self, new_root: [u8; 32]) {
         if !self.roots.contains(&new_root) {
             if self.roots.len() >= MAX_ROOTS {

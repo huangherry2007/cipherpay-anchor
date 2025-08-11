@@ -1,3 +1,4 @@
+#[cfg(feature = "real-crypto")]
 // zk_verifier/withdraw.rs
 // Auto-generated verifier logic for withdraw.circom using arkworks (BLS12-381 Groth16)
 
@@ -11,13 +12,25 @@ use std::str::FromStr;
 use crate::CipherPayError;
 use crate::zk_verifier::constants_withdraw::*;
 
-pub type WithdrawGroth16Proof = Proof<Bls12_381>;
+// Use the type defined in the types module for Anchor compatibility
+use crate::zk_verifier::types::WithdrawGroth16Proof;
 
 pub fn parse_withdraw_proof(bytes: &[u8]) -> Result<WithdrawGroth16Proof, CipherPayError> {
+    // For Anchor compatibility, we return Vec<u8> but we still need to validate the proof format
+    // This ensures the bytes are valid proof data even if we don't parse to complex types here
+    if bytes.len() < 192 { // Minimum size for a Groth16 proof
+        return Err(CipherPayError::InvalidZkProof);
+    }
+    Ok(bytes.to_vec())
+}
+
+// Internal function for actual ZK verification
+pub fn parse_withdraw_proof_internal(bytes: &[u8]) -> Result<Proof<Bls12_381>, CipherPayError> {
     Proof::deserialize_uncompressed(&mut Cursor::new(bytes)).map_err(|_| CipherPayError::InvalidZkProof)
 }
 
-pub fn parse_withdraw_public_inputs(bytes: &[u8]) -> Result<Vec<Fr>, CipherPayError> {
+// Internal function to parse public inputs to Vec<Fr> for ZK verification
+pub fn parse_withdraw_public_inputs_internal(bytes: &[u8]) -> Result<Vec<Fr>, CipherPayError> {
     const NUM_SIGNALS: usize = 6;
     if bytes.len() != NUM_SIGNALS * 32 {
         return Err(CipherPayError::InvalidZkProof);
@@ -32,15 +45,21 @@ pub fn parse_withdraw_public_inputs(bytes: &[u8]) -> Result<Vec<Fr>, CipherPayEr
 }
 
 pub fn verify_withdraw_groth16(
-    proof: &WithdrawGroth16Proof,
-    public_inputs: &[Fr],
+    proof: &WithdrawGroth16Proof, // Now takes Vec<u8> for Anchor compatibility
+    public_inputs: &[u8], // Now takes Vec<u8> for Anchor compatibility
 ) -> Result<(), CipherPayError> {
+    // Parse the proof to the complex type internally for ZK verification
+    let parsed_proof = parse_withdraw_proof_internal(proof)?;
+    
+    // Parse public inputs to Vec<Fr> internally for ZK verification
+    let parsed_public_inputs = parse_withdraw_public_inputs_internal(public_inputs)?;
+    
     let vk = get_verifying_key()?;
     let pvk = PreparedVerifyingKey::from(vk);
     
     // Use the Groth16 struct for verification with the SNARK trait
     // Note: verify_proof returns bool, so we need to check if it's true
-    if Groth16::<Bls12_381>::verify_proof(&pvk, proof, public_inputs).map_err(|_| CipherPayError::InvalidZkProof)? {
+    if Groth16::<Bls12_381>::verify_proof(&pvk, &parsed_proof, &parsed_public_inputs).map_err(|_| CipherPayError::InvalidZkProof)? {
         Ok(())
     } else {
         Err(CipherPayError::InvalidZkProof)

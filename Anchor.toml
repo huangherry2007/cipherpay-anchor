@@ -3,7 +3,7 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-cipherpay_anchor = "XeEs3gHZGdDhs3Lm1VoukrWrEnjdC3CA5VRtowN5MGz"
+cipherpay_anchor = "GMfPVVTDx6gBqbm7xJjvUJsT7aE8rG1WFfgf9sS5BVDg"
 
 [registry]
 url = "https://api.apr.dev"
@@ -12,12 +12,12 @@ url = "https://api.apr.dev"
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
-[scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+# [scripts]
+# test = "anchor test"
 
 [workspace]
 members = [
-  "programs/cipherpay-anchor"
+  "."
 ]
 
 [build]

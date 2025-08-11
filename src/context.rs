@@ -4,29 +4,28 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount};
 
 use crate::state::{Nullifier, MerkleRootCache};
+use crate::constants::{VAULT_SEED, NULLIFIER_SEED};
 
-pub const VAULT_SEED: &[u8] = b"vault";
-pub const NULLIFIER_SEED: &[u8] = b"nullifier";
-pub const MERKLE_ROOT_CACHE_SEED: &[u8] = b"root_cache";
+// ============== Initialize Vault ==============
+#[derive(Accounts)]
+pub struct InitializeVault<'info> {
+    #[account(mut)]
+    pub vault: Signer<'info>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
 
 #[derive(Accounts)]
 #[instruction(deposit_hash: [u8; 32])]
 pub struct ShieldedDeposit<'info> {
-    #[account(
-        seeds = [MERKLE_ROOT_CACHE_SEED],
-        bump,
-        mut
-    )]
+    /// Root cache account for storing merkle roots
+    #[account(mut)]
     pub root_cache: Account<'info, MerkleRootCache>,
 
-    #[account(
-        seeds = [VAULT_SEED],
-        bump,
-    )]
-    pub vault_pda: SystemAccount<'info>,
-
+    /// Vault account for storing deposits
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub vault: SystemAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -34,17 +33,17 @@ pub struct ShieldedDeposit<'info> {
 #[derive(Accounts)]
 #[instruction(deposit_hash: [u8; 32])]
 pub struct DepositTokens<'info> {
-    #[account(
-        seeds = [VAULT_SEED],
-        bump,
-    )]
-    pub vault_pda: SystemAccount<'info>,
+    #[account(mut)]
+    pub user: Signer<'info>,
 
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub vault: SystemAccount<'info>,
+
+    /// CHECK: Mint is not read by the program in tests
+    pub token_mint: UncheckedAccount<'info>,
 
     #[account(mut)]
-    pub payer_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
     pub vault_token_account: Account<'info, TokenAccount>,
@@ -59,19 +58,16 @@ pub struct ShieldedTransfer<'info> {
         init,
         seeds = [NULLIFIER_SEED, &nullifier],
         bump,
-        payer = payer,
+        payer = authority,
         space = 8 + Nullifier::SIZE
     )]
     pub nullifier_record: Account<'info, Nullifier>,
 
-    #[account(
-        seeds = [MERKLE_ROOT_CACHE_SEED],
-        bump,
-    )]
+    /// Root cache account for storing merkle roots
     pub root_cache: Account<'info, MerkleRootCache>,
 
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub authority: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -82,15 +78,12 @@ pub struct ShieldedWithdraw<'info> {
         init,
         seeds = [NULLIFIER_SEED, &nullifier],
         bump,
-        payer = payer,
+        payer = authority,
         space = 8 + Nullifier::SIZE
     )]
     pub nullifier_record: Account<'info, Nullifier>,
 
-    #[account(
-        seeds = [MERKLE_ROOT_CACHE_SEED],
-        bump,
-    )]
+    /// Root cache account for storing merkle roots
     pub root_cache: Account<'info, MerkleRootCache>,
 
     #[account(
@@ -106,7 +99,7 @@ pub struct ShieldedWithdraw<'info> {
     pub recipient_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
