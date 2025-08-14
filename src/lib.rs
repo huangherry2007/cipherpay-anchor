@@ -4,7 +4,7 @@ use anchor_lang::prelude::*;
 #[cfg(feature = "real-crypto")]
 use anchor_spl::token::{self, Transfer as SplTransfer};
 
-use crate::constants::VAULT_SEED;
+// use crate::constants::VAULT_SEED; // Not currently used
 
 declare_id!("GMfPVVTDx6gBqbm7xJjvUJsT7aE8rG1WFfgf9sS5BVDg");
 
@@ -18,8 +18,8 @@ pub mod zk_verifier;
 
 use crate::context::*;
 use crate::error::CipherPayError;
-use crate::state::*;
-use crate::utils::*;
+// use crate::state::*; // Not currently used
+// use crate::utils::*; // Not currently used
 #[cfg(feature = "real-crypto")]
 use crate::zk_verifier::{
     parse_deposit_proof,
@@ -111,9 +111,23 @@ pub fn shielded_deposit(
 ) -> Result<()> {
     #[cfg(feature = "real-crypto")]
     {
+        // Parse and validate proof format
         let proof = parse_deposit_proof(&proof_bytes)?;
         let public_inputs = parse_deposit_public_inputs(&public_inputs_bytes)?;
-        verify_deposit_groth16(&proof, &public_inputs)?;
+        
+        // Call zkVerify CPI for on-chain verification
+        let cpi_program = ctx.accounts.zkverify_program.to_account_info();
+        let cpi_accounts = zkverify::cpi::accounts::VerifyGroth16 {};
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        
+        let verify_args = zkverify::cpi::Groth16VerifyArgs {
+            proof: proof.clone(),
+            public_inputs: public_inputs.clone(),
+            vk_id: vk_ids::DEPOSIT_VK_ID,
+        };
+        
+        // This will fail the transaction if verification fails
+        zkverify::cpi::verify_groth16(cpi_ctx, verify_args)?;
 
         // === Validate deposit hash ===
         // We'll do the validation in the zk_verifier module to avoid exposing arkworks types here
@@ -170,9 +184,23 @@ pub fn shielded_transfer(
 ) -> Result<()> {
     #[cfg(feature = "real-crypto")]
     {
+        // Parse and validate proof format
         let proof = parse_transfer_proof(&proof_bytes)?;
         let public_inputs = parse_transfer_public_inputs(&public_inputs_bytes)?;
-        verify_transfer_groth16(&proof, &public_inputs)?;
+        
+        // Call zkVerify CPI for on-chain verification
+        let cpi_program = ctx.accounts.zkverify_program.to_account_info();
+        let cpi_accounts = zkverify::cpi::accounts::VerifyGroth16 {};
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        
+        let verify_args = zkverify::cpi::Groth16VerifyArgs {
+            proof: proof.clone(),
+            public_inputs: public_inputs.clone(),
+            vk_id: vk_ids::TRANSFER_VK_ID,
+        };
+        
+        // This will fail the transaction if verification fails
+        zkverify::cpi::verify_groth16(cpi_ctx, verify_args)?;
 
         // Validate nullifier using helper function
         require!(
@@ -247,9 +275,23 @@ pub fn shielded_withdraw(
 ) -> Result<()> {
     #[cfg(feature = "real-crypto")]
     {
+        // Parse and validate proof format
         let proof = parse_withdraw_proof(&proof_bytes)?;
         let public_inputs = parse_withdraw_public_inputs(&public_inputs_bytes)?;
-        verify_withdraw_groth16(&proof, &public_inputs)?;
+        
+        // Call zkVerify CPI for on-chain verification
+        let cpi_program = ctx.accounts.zkverify_program.to_account_info();
+        let cpi_accounts = zkverify::cpi::accounts::VerifyGroth16 {};
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        
+        let verify_args = zkverify::cpi::Groth16VerifyArgs {
+            proof: proof.clone(),
+            public_inputs: public_inputs.clone(),
+            vk_id: vk_ids::WITHDRAW_VK_ID,
+        };
+        
+        // This will fail the transaction if verification fails
+        zkverify::cpi::verify_groth16(cpi_ctx, verify_args)?;
 
         // Validate nullifier using helper function
         require!(
