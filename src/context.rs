@@ -27,10 +27,6 @@ pub struct ShieldedDeposit<'info> {
     #[account(mut)]
     pub vault: SystemAccount<'info>,
 
-    /// zkVerify program for Groth16 proof verification
-    /// CHECK: This is the zkVerify program ID
-    pub zkverify_program: UncheckedAccount<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -70,10 +66,6 @@ pub struct ShieldedTransfer<'info> {
     /// Root cache account for storing merkle roots
     pub root_cache: Account<'info, MerkleRootCache>,
 
-    /// zkVerify program for Groth16 proof verification
-    /// CHECK: This is the zkVerify program ID
-    pub zkverify_program: UncheckedAccount<'info>,
-
     #[account(mut)]
     pub authority: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -93,10 +85,6 @@ pub struct ShieldedWithdraw<'info> {
 
     /// Root cache account for storing merkle roots
     pub root_cache: Account<'info, MerkleRootCache>,
-
-    /// zkVerify program for Groth16 proof verification
-    /// CHECK: This is the zkVerify program ID
-    pub zkverify_program: UncheckedAccount<'info>,
 
     #[account(
         seeds = [VAULT_SEED],
