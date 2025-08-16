@@ -7,7 +7,7 @@ use ark_ff::PrimeField;
 use ark_groth16::{Groth16, Proof, VerifyingKey, PreparedVerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use ark_std::vec::Vec;
-use std::io::Cursor;
+use ark_std::io::Cursor;
 use std::str::FromStr;
 use crate::CipherPayError;
 use crate::zk_verifier::constants_deposit::*;

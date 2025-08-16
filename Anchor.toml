@@ -3,7 +3,13 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-cipherpay_anchor = "GMfPVVTDx6gBqbm7xJjvUJsT7aE8rG1WFfgf9sS5BVDg"
+cipherpay_anchor = "C2BxtBbLeazgMuYqkqu1QnAcAioiWmRYNEir7qogvMgP"
+
+[idl]
+out = "target/idl"
+
+[typescript]
+out = "target/types"
 
 [registry]
 url = "https://api.apr.dev"

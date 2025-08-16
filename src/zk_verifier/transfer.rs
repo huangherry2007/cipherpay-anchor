@@ -7,7 +7,7 @@ use ark_ff::PrimeField;
 use ark_groth16::{Groth16, Proof, VerifyingKey, PreparedVerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use ark_std::vec::Vec;
-use std::io::Cursor;
+use ark_std::io::Cursor;
 use std::str::FromStr;
 use crate::CipherPayError;
 use crate::zk_verifier::constants_transfer::*;
@@ -78,7 +78,7 @@ fn parse_g2(coords: [[&str; 2]; 2]) -> ark_bls12_381::G2Affine {
     use ark_bls12_381::g2::G2Affine;
     use ark_bls12_381::Fq2;
     use ark_bls12_381::Fq;
-    let x = Fq2::new(Fq::from_str(coords[0][0]).unwrap(), Fq::from_str(coords[1][0]).unwrap());
+    let x = Fq2::new(Fq::from_str(coords[0][0]).unwrap(), Fq::from_str(coords[0][1]).unwrap());
     let y = Fq2::new(Fq::from_str(coords[1][0]).unwrap(), Fq::from_str(coords[1][1]).unwrap());
     G2Affine::new_unchecked(x, y)
 }

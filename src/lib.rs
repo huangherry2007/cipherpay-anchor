@@ -6,7 +6,7 @@ use anchor_spl::token::{self, Transfer as SplTransfer};
 
 use crate::constants::VAULT_SEED;
 
-declare_id!("GMfPVVTDx6gBqbm7xJjvUJsT7aE8rG1WFfgf9sS5BVDg");
+declare_id!("C2BxtBbLeazgMuYqkqu1QnAcAioiWmRYNEir7qogvMgP");
 
 pub mod context;
 pub mod error;
