@@ -22,26 +22,14 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
-# Use a lightweight default for SBF builds; enable real-crypto explicitly for x86 testing
 default = []
-real-crypto = [
-    "ark-bn254",
-    "ark-bls12-381",
-    "ark-ff",
-    "ark-ec",
-    "ark-std",
-    "ark-serialize",
-    "ark-groth16",
-    "ark-relations",
-    "ark-crypto-primitives",
-    "ark-snark"
-]
+real-crypto = []
+# Optional: use Memo crate instead of hardcoding the program id
+memo = ["spl-memo"]
 
 [dependencies]
 anchor-lang = "0.31.1"
-anchor-spl  = { version = "0.31.1", default-features = false, features = ["token"] }
-# (remove any [patch.crates-io] you've added earlier)
-
+anchor-spl  = { version = "0.31.1", default-features = false, features = ["token", "token_2022", "associated_token"] }
 
 # Pin to Solana 2.x and strip defaults for safety
 solana-program = { version = "2.3.0", default-features = false }
@@ -51,18 +39,21 @@ bytemuck    = { version = "1.13", features = ["derive"] }
 sha2        = "0.10.8"
 lazy_static = "1.4"
 
-# Curves: keep only "curve"
-ark-bn254      = { version = "0.4.0", optional = true, default-features = false, features = ["curve"] }
-ark-bls12-381  = { version = "0.4.0", optional = true, default-features = false, features = ["curve"] }
+# Solana-native Groth16 verifier (replaces all Arkworks)
+groth16-solana = "0.2.0"
 
-# Bases: no features needed on 0.4; `default-features = false` => no_std+alloc
-ark-std        = { version = "0.4.0", optional = true, default-features = false }
-ark-ff         = { version = "0.4.0", optional = true, default-features = false }
-ark-ec         = { version = "0.4.0", optional = true, default-features = false }
-ark-serialize  = { version = "0.4.0", optional = true, default-features = false }
-ark-relations  = { version = "0.4.0", optional = true, default-features = false }
-ark-groth16    = { version = "0.4.0", optional = true, default-features = false }
-ark-crypto-primitives = { version = "0.4.0", optional = true, default-features = false, features = ["r1cs"] }
-ark-snark      = { version = "0.4.0", optional = true, default-features = false }
+# Optional — only if you want `spl_memo::id()` instead of a hardcoded key:
+spl-memo = { version = "4", optional = true, default-features = false }
+
+[dev-dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.1", features = ["token", "token_2022"] }
+solana-program-test = "2.3.0"
+solana-sdk = "2.3.0"
+tokio = { version = "1.0", features = ["full"] }
+assert_matches = "1.5"
+pretty_assertions = "1.4"
+env_logger = "0.10"
+rand = "0.8"
 
 [patch.crates-io]
