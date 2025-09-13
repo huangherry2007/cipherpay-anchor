@@ -77,8 +77,13 @@ const DEPOSIT_SEED = Buffer.from("deposit");
 // mint config — we use 0 decimals to keep amounts simple
 const MINT_DECIMALS = 0 as const;
 
+// Memo program id (for pretty printing)
+const MEMO_PROGRAM_ID = new web3.PublicKey(
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+);
+
 // ───────────────────────── tests ─────────────────────────
-describe("shielded_deposit_atomic (end-to-end)", () => {
+describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right)", () => {
   const connection = new web3.Connection(RPC_URL, "confirmed");
   const wallet = new anchor.Wallet(
     web3.Keypair.fromSecretKey(
@@ -102,11 +107,13 @@ describe("shielded_deposit_atomic (end-to-end)", () => {
   const programId = program.programId;
   const payer = wallet.publicKey;
 
+  console.log("🧭 programId:", programId.toBase58());
+
   // will be populated in tests
   let proofBytes: Buffer;
   let publicInputsBytes: Buffer;
   let depositHash: Buffer; // 32B (LE)
-  let amountU64: number;   // parsed to JS number
+  let amountU64: number; // parsed to JS number
 
   // token + PDAs
   let tokenMint!: web3.PublicKey;
@@ -128,7 +135,10 @@ describe("shielded_deposit_atomic (end-to-end)", () => {
 
     // extract fields
     depositHash = slice32(publicInputsBytes, DEPOSIT_IDX.DEPOSIT_HASH);
-    console.log("🔑 depositHash (LE):", toHexLE(depositHash));
+    console.log(
+      "🔑 depositHash (LE, hex):",
+      toHexLE(depositHash)
+    );
 
     const amountFe = slice32(publicInputsBytes, DEPOSIT_IDX.AMOUNT);
     // little-endian u64 in first 8 bytes → JS number (assumes it fits)
@@ -163,8 +173,8 @@ describe("shielded_deposit_atomic (end-to-end)", () => {
     tokenMint = await createMint(
       connection,
       wallet.payer, // fee payer
-      payer,        // mint authority
-      null,         // freeze authority
+      payer, // mint authority
+      null, // freeze authority
       MINT_DECIMALS
     );
     console.log("✅ token mint:", tokenMint.toBase58());
@@ -222,14 +232,14 @@ describe("shielded_deposit_atomic (end-to-end)", () => {
     console.log("✅ minted amount to payer ATA");
   });
 
-  it("verifies on-chain via shielded_deposit_atomic", async () => {
-    // the PDA for the per-deposit idempotent marker
+  it("verifies on-chain via shielded_deposit_atomic (auto-match seeds)", async () => {
+    // the PDA for the per-deposit idempotent marker (what Anchor enforces)
     const [depositMarkerPda] = web3.PublicKey.findProgramAddressSync(
       [DEPOSIT_SEED, depositHash],
       programId
     );
 
-    // pre-ixs: CU, transferChecked, memo(32B raw)
+    // pre-ixs
     const cuIx = web3.ComputeBudgetProgram.setComputeUnitLimit({
       units: CU_LIMIT,
     });
@@ -237,53 +247,120 @@ describe("shielded_deposit_atomic (end-to-end)", () => {
       microLamports: 0,
     });
 
+    // SPL transfer (payer ATA -> vault ATA)
     const transferIx = createTransferCheckedInstruction(
       payerAta,
       tokenMint,
       vaultAta,
-      payer,
+      payer, // owner/authority of payerAta
       amountU64,
       MINT_DECIMALS,
       [],
       TOKEN_PROGRAM_ID
     );
 
-    // Encode 32B depositHash as UTF-8 text for the Memo program
+    // Memo binds the deposit hash (hex string, readable)
     const memoHex = "deposit:" + Buffer.from(depositHash).toString("hex");
-    const memoIx = createMemoInstruction(memoHex, [payer]); // signer optional but useful
+    const memoIx = createMemoInstruction(memoHex, [payer]);
+
+    // Build the program instruction (Anchor)
+    const mb = program.methods
+      .shieldedDepositAtomic(depositHash, proofBytes, publicInputsBytes)
+      .accountsPartial({
+        payer,
+        rootCache: rootCache.publicKey,
+        depositMarker: depositMarkerPda,
+        vaultPda,
+        vaultTokenAccount: vaultAta,
+        tokenMint,
+        instructions: web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+        systemProgram: web3.SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      });
+
+    const anchorIx = await mb.instruction();
+
+    // IMPORTANT: put the Token transfer **immediately before** our program ix.
+    // Memo can come anywhere; we keep it too for your on-chain check.
+    const tx = new web3.Transaction().add(
+      cuIx,
+      feeIx,
+      memoIx,
+      transferIx, // <── adjacency to our program ix
+      anchorIx
+    );
+
+    // Pretty-print the built transaction so we can see what's inside *before* sending.
+    console.log("🔎 full tx instructions:");
+    tx.instructions.forEach((ix, i) => {
+      const pid = ix.programId.toBase58();
+      const tag =
+        pid === TOKEN_PROGRAM_ID.toBase58()
+          ? "spl-token"
+          : pid === MEMO_PROGRAM_ID.toBase58()
+          ? "memo"
+          : pid === programId.toBase58()
+          ? "cipherpay-anchor"
+          : pid === web3.SystemProgram.programId.toBase58()
+          ? "system"
+          : "other";
+      console.log(`  [${i}] program=${pid} (${tag})`);
+      if (pid === TOKEN_PROGRAM_ID.toBase58()) {
+        const k = ix.keys.map((m) => m.pubkey.toBase58());
+        console.log(
+          `      token.keys: src=${k[0]} mint=${k[1]} dst=${k[2]} auth=${k[3]}`
+        );
+      }
+    });
+
+    // Quick local assert to catch missing/incorrect transfer before RPC:
+    const hasCorrectTransfer = tx.instructions.some(
+      (ix) =>
+        ix.programId.equals(TOKEN_PROGRAM_ID) &&
+        ix.keys.length >= 3 &&
+        ix.keys[2].pubkey.equals(vaultAta) // destination is 3rd key
+    );
+    if (!hasCorrectTransfer) {
+      throw new Error(
+        `DEBUG: built tx does not contain a spl-token transfer to expected vault ATA: ${vaultAta.toBase58()}`
+      );
+    }
+
+    // (Optional) print the account metas of the Anchor ix too
+    console.log("🔎 ix.accounts:");
+    anchorIx.keys.forEach((k, i) => {
+      const w = k.isWritable ? " (writable)" : "";
+      const s = k.isSigner ? " (signer)" : "";
+      console.log(`  [${i}] ${k.pubkey.toBase58()}${s}${w}`);
+    });
 
     try {
-      const txSig = await program.methods
-        .shieldedDepositAtomic(depositHash, proofBytes, publicInputsBytes)
-        // Use accountsPartial to be robust if the generated TS type is stale.
-        .accountsPartial({
-          payer,
-          rootCache: rootCache.publicKey,
-          depositMarker: depositMarkerPda,     // required by runtime IDL
-          vaultPda,
-          vaultTokenAccount: vaultAta,
-          tokenMint,
-          instructions: web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-          // systemProgram omitted on purpose (auto-resolved)
-          tokenProgram: TOKEN_PROGRAM_ID,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        })
-        .preInstructions([cuIx, feeIx, transferIx, memoIx])
-        .rpc();
+      const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: false });
+      console.log("✅ shielded_deposit_atomic tx:", sig);
 
-      console.log("✅ shielded_deposit_atomic tx:", txSig);
+      // show on-chain logs even on success
+      const res = await connection.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      console.log("---- on-chain logs ----");
+      res?.meta?.logMessages?.forEach((l) => console.log(l));
+      console.log("---- end logs ----");
     } catch (e: any) {
-      console.error("❌ sendAndConfirm failed:", e?.message ?? e);
+      const msg = String(e?.message ?? e);
+      console.warn("⚠️ first attempt failed:", msg);
       if (e?.logs) {
-        console.error("---- logs start ----");
-        for (const line of e.logs) console.error(line);
-        console.error("---- logs end ----");
+        console.warn("---- logs (attempt 1) ----");
+        for (const line of e.logs) console.warn(line);
+        console.warn("---- end logs ----");
       }
       throw e;
     }
   });
 
   it("sanity: proof structure", () => {
+    // a/b/c segments for Groth16 proof
     const a = proofBytes.subarray(0, 64);
     const b = proofBytes.subarray(64, 192);
     const c = proofBytes.subarray(192, 256);
