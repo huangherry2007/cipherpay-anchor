@@ -1,3 +1,4 @@
+// src/context.rs
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
@@ -56,7 +57,7 @@ pub struct DepositTokens<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-// Make sure this struct already carries the instruction args so Anchor can use them in attributes
+/// Atomic deposit accounts (production)
 #[derive(Accounts)]
 #[instruction(deposit_hash: Vec<u8>, proof_bytes: Vec<u8>, public_inputs_bytes: Vec<u8>)]
 pub struct ShieldedDepositAtomic<'info> {
@@ -66,24 +67,15 @@ pub struct ShieldedDepositAtomic<'info> {
     #[account(mut)]
     pub root_cache: Account<'info, MerkleRootCache>,
 
-    // ── deposit_marker: NORMAL path ───────────────────────────────────────────
-    #[cfg(not(feature = "debug-seeds"))]
+    // The deposit marker PDA is created once per `deposit_hash`.
     #[account(
         init,
         payer = payer,
-        // ✅ use SPACE (struct size) and add 8 for discriminator
         space = 8 + DepositMarker::SPACE,
-        // IMPORTANT: use the shared constant so it matches on-chain exactly.
         seeds = [DEPOSIT_MARKER_SEED, deposit_hash.as_ref()],
         bump
     )]
     pub deposit_marker: Account<'info, DepositMarker>,
-
-    // ── deposit_marker: DEBUG path (no seeds/deserialize, just a key to log) ─
-    #[cfg(feature = "debug-seeds")]
-    /// CHECK: debug mode — we verify seeds in the handler and abort (no state writes).
-    #[account(mut)]
-    pub deposit_marker: UncheckedAccount<'info>,
 
     /// CHECK: program vault PDA (authority)
     pub vault_pda: UncheckedAccount<'info>,
@@ -99,10 +91,9 @@ pub struct ShieldedDepositAtomic<'info> {
     pub instructions: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, anchor_spl::token::Token>,
-    pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
-
 
 /// Nullifier record for shielded transfer
 #[derive(Accounts)]

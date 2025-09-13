@@ -25,9 +25,6 @@ use crate::utils::{
 #[cfg(feature = "real-crypto")]
 use crate::zk_verifier::solana_verifier;
 
-#[cfg(feature = "debug-seeds")]
-use anchor_lang::solana_program::pubkey::Pubkey;
-
 declare_id!("9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o");
 
 pub mod constants;
@@ -42,8 +39,11 @@ pub mod zk_verifier;
 #[allow(deprecated)]
 pub mod cipherpay_anchor {
     use super::*;
+
     #[cfg(feature = "real-crypto")]
     use crate::zk_verifier::solana_verifier::{deposit_idx, transfer_idx, withdraw_idx};
+
+    // For builds without `real-crypto`, provide indices so the code compiles.
     #[cfg(not(feature = "real-crypto"))]
     mod stub_idx {
         pub mod deposit_idx {
@@ -91,160 +91,99 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Atomic deposit: enforces Memo(deposit_hash) + SPL TransferChecked to the vault ATA
-    /// in the *same* transaction, then accepts the zk-proof and rolls the Merkle root forward.
+    /// Atomic deposit: Memo(deposit_hash) + SPL TransferChecked to vault ATA in the *same* tx,
+    /// then accept zk-proof and roll the Merkle root forward.
     pub fn shielded_deposit_atomic(
         ctx: Context<ShieldedDepositAtomic>,
         deposit_hash: Vec<u8>,
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
-        // Validate and normalize the deposit hash first.
+        // 0) Basic arg check + normalize
         require!(deposit_hash.len() == 32, CipherPayError::InvalidInput);
         let mut deposit_hash32 = [0u8; 32];
         deposit_hash32.copy_from_slice(&deposit_hash);
 
-        // ───────────────────── DEBUG-SEEDS PATH ─────────────────────
-        // In this mode we DO NOT mutate accounts. We only print PDA candidates
-        // computed on-chain, then return an error so you can read the logs.
-        #[cfg(feature = "debug-seeds")]
+        // marker exists (freshly inited here); allow idempotent early return if already processed
+        let marker = &mut ctx.accounts.deposit_marker;
+        if marker.processed {
+            return Ok(());
+        }
+        marker.bump = ctx.bumps.deposit_marker;
+
+        #[cfg(feature = "real-crypto")]
         {
-            msg!("🔬 [debug-seeds] program_id: {}", ctx.program_id);
+            // 1) Verify zk proof
+            solana_verifier::verify_deposit(&proof_bytes, &public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
 
-            // hex string without extra deps
-            let mut hex = String::with_capacity(64);
-            for b in deposit_hash32.iter() {
-                use core::fmt::Write;
-                let _ = write!(&mut hex, "{:02x}", b);
+            // 2) Parse public signals
+            let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+            let new_commitment        = sigs[deposit_idx::NEW_COMMITMENT];
+            let owner_cipherpay_pk    = sigs[deposit_idx::OWNER_CIPHERPAY_PUBKEY];
+            let new_root              = sigs[deposit_idx::NEW_MERKLE_ROOT];
+            let new_next_leaf_index   = sigs[deposit_idx::NEW_NEXT_LEAF_INDEX];
+            let amount_fe             = sigs[deposit_idx::AMOUNT];
+            let expected_deposit_hash = sigs[deposit_idx::DEPOSIT_HASH];
+
+            // 3) Proof must bind to the same deposit_hash bytes
+            require!(expected_deposit_hash == deposit_hash32, CipherPayError::InvalidZkProof);
+
+            // 4) field element (LE) -> u64
+            let mut amount_u64: u64 = 0;
+            for i in 0..8 {
+                amount_u64 |= (amount_fe[i] as u64) << (8 * i);
             }
-            msg!("🔬 deposit_hash (LE, hex) = {}", hex);
 
-            let (pda_raw, bump_raw) =
-                Pubkey::find_program_address(&[DEPOSIT_MARKER_SEED, &deposit_hash32], ctx.program_id);
-            let mut dh_rev = deposit_hash32;
-            dh_rev.reverse();
-            let (pda_rev, bump_rev) =
-                Pubkey::find_program_address(&[DEPOSIT_MARKER_SEED, &dh_rev], ctx.program_id);
-            let (pda_empty, bump_empty) =
-                Pubkey::find_program_address(&[DEPOSIT_MARKER_SEED], ctx.program_id);
-
-            let seed_txt = core::str::from_utf8(DEPOSIT_MARKER_SEED).unwrap_or("<bin>");
-            msg!("🔬 expected PDA (seed=[\"{}\", 32 raw])    = {} (bump {})", seed_txt, pda_raw, bump_raw);
-            msg!("🔬 expected PDA (seed=[\"{}\", 32 rev])    = {} (bump {})", seed_txt, pda_rev, bump_rev);
-            msg!("🔬 expected PDA (seed=[\"{}\"])            = {} (bump {})", seed_txt, pda_empty, bump_empty);
-            msg!("🔬 provided deposit_marker account         = {}", ctx.accounts.deposit_marker.key());
-
-            // Also print the order of all accounts Anchor passed to the ix, for sanity.
-            // (Indices mirror your TS logs.)
-            msg!("🔎 accounts (as seen by program):");
-            msg!("  [payer]                {}", ctx.accounts.payer.key());
-            msg!("  [root_cache]           {}", ctx.accounts.root_cache.key());
-            msg!("  [deposit_marker]       {}", ctx.accounts.deposit_marker.key());
-            msg!("  [vault_pda]            {}", ctx.accounts.vault_pda.key());
-            msg!("  [vault_token_account]  {}", ctx.accounts.vault_token_account.key());
-            msg!("  [token_mint]           {}", ctx.accounts.token_mint.key());
-            msg!("  [instructions]         {}", ctx.accounts.instructions.key());
-            msg!("  [system_program]       {}", ctx.accounts.system_program.key());
-            msg!("  [token_program]        {}", ctx.accounts.token_program.key());
-            msg!("  [associated_token_prog]{}", ctx.accounts.associated_token_program.key());
-
-            // Keep going: verify memo + SPL transfer, then succeed (no state writes).
+            // 5) Atomicity: Memo + exact SPL transfer to our vault ATA
             assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
-            // In stub/debug builds, expected_amount=0 means "wildcard" (see utils.rs).
             assert_transfer_checked_in_same_tx(
                 &ctx.accounts.instructions,
                 &ctx.accounts.vault_token_account.key(),
-                0,
+                amount_u64,
             )?;
-            msg!("✅ [debug-seeds] memo + SPL transfer present; finishing OK (no marker writes)");
-            return Ok(());
+
+            // 6) Commit: update root cache + mark processed
+            insert_merkle_root(&new_root, &mut ctx.accounts.root_cache);
+            marker.processed = true;
+
+            // 7) Emit
+            emit!(DepositCompleted {
+                deposit_hash: deposit_hash32,
+                owner_cipherpay_pubkey: owner_cipherpay_pk,
+                commitment: new_commitment,
+                new_merkle_root: new_root,
+                next_leaf_index: u32::from_le_bytes([
+                    new_next_leaf_index[0], new_next_leaf_index[1],
+                    new_next_leaf_index[2], new_next_leaf_index[3]
+                ]),
+                mint: ctx.accounts.token_mint.key(),
+            });
         }
 
-        // ───────────────────── NORMAL PATH ─────────────────────
-        // Here Anchor enforces the seeds; we update the deposit_marker and root cache.
-        #[cfg(not(feature = "debug-seeds"))]
+        #[cfg(not(feature = "real-crypto"))]
         {
-            let marker = &mut ctx.accounts.deposit_marker;
-            if marker.processed {
-                // idempotent no-op
-                return Ok(());
-            }
-            marker.bump = ctx.bumps.deposit_marker;
+            // In non-crypto builds, still enforce atomicity (amount wildcard)
+            assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
+            assert_transfer_checked_in_same_tx(
+                &ctx.accounts.instructions,
+                &ctx.accounts.vault_token_account.key(),
+                0, // wildcard: any positive amount
+            )?;
 
-            #[cfg(feature = "real-crypto")]
-            {
-                // 1) Verify the zk proof
-                solana_verifier::verify_deposit(&proof_bytes, &public_inputs_bytes)
-                    .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
-
-                // 2) Parse public signals (order: newCommitment, ownerKey, newRoot, newNextIndex, amount, depositHash)
-                let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
-                    .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
-                let new_commitment        = sigs[deposit_idx::NEW_COMMITMENT];
-                let owner_cipherpay_pk    = sigs[deposit_idx::OWNER_CIPHERPAY_PUBKEY];
-                let new_root              = sigs[deposit_idx::NEW_MERKLE_ROOT];
-                let new_next_leaf_index   = sigs[deposit_idx::NEW_NEXT_LEAF_INDEX];
-                let amount_fe             = sigs[deposit_idx::AMOUNT];
-                let expected_deposit_hash = sigs[deposit_idx::DEPOSIT_HASH];
-
-                // 3) The hash bound inside the proof must match instruction arg
-                require!(expected_deposit_hash == deposit_hash32, CipherPayError::InvalidZkProof);
-
-                // 4) Convert amount field element -> u64 (LE first 8 bytes)
-                let mut amount_u64: u64 = 0;
-                for i in 0..8 { amount_u64 |= (amount_fe[i] as u64) << (8*i); }
-
-                // 5) ENFORCE atomicity:
-                //    (a) the tx carries a Memo with EXACT deposit_hash bytes
-                assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
-                //    (b) the tx carries an SPL Transfer/TransferChecked TO our vault ATA with EXACT amount
-                assert_transfer_checked_in_same_tx(
-                    &ctx.accounts.instructions,
-                    &ctx.accounts.vault_token_account.key(),
-                    amount_u64,
-                )?;
-
-                // 6) Update root cache and mark idempotent processed
-                insert_merkle_root(&new_root, &mut ctx.accounts.root_cache);
-                marker.processed = true;
-
-                // 7) Emit
-                emit!(DepositCompleted {
-                    deposit_hash: deposit_hash32,
-                    owner_cipherpay_pubkey: owner_cipherpay_pk,
-                    commitment: new_commitment,
-                    new_merkle_root: new_root,
-                    next_leaf_index: u32::from_le_bytes([
-                        new_next_leaf_index[0], new_next_leaf_index[1],
-                        new_next_leaf_index[2], new_next_leaf_index[3]
-                    ]),
-                    mint: ctx.accounts.token_mint.key(),
-                });
-            }
-
-            #[cfg(not(feature = "real-crypto"))]
-            {
-                // In stub mode, still enforce memo + presence of transfer (amount = 0 ok)
-                assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
-                assert_transfer_checked_in_same_tx(
-                    &ctx.accounts.instructions,
-                    &ctx.accounts.vault_token_account.key(),
-                    0,
-                )?;
-
-                marker.processed = true;
-                emit!(DepositCompleted {
-                    deposit_hash: deposit_hash32,
-                    owner_cipherpay_pubkey: [0u8; 32],
-                    commitment: [0u8; 32],
-                    new_merkle_root: [0u8; 32],
-                    next_leaf_index: 0,
-                    mint: ctx.accounts.token_mint.key(),
-                });
-            }
-
-            Ok(())
+            marker.processed = true;
+            emit!(DepositCompleted {
+                deposit_hash: deposit_hash32,
+                owner_cipherpay_pubkey: [0u8; 32],
+                commitment: [0u8; 32],
+                new_merkle_root: [0u8; 32],
+                next_leaf_index: 0,
+                mint: ctx.accounts.token_mint.key(),
+            });
         }
+
+        Ok(())
     }
 
     /// Spend one note, create two, update Merkle roots (no SPL I/O).
@@ -273,17 +212,12 @@ pub mod cipherpay_anchor {
 
             require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
 
-            // consume nullifier
             let rec = &mut ctx.accounts.nullifier_record;
             require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
             rec.used = true;
             rec.bump = ctx.bumps.nullifier_record;
 
-            // check known root and roll forward
-            require!(
-                is_valid_root(&merkle_root_before, &ctx.accounts.root_cache),
-                CipherPayError::UnknownMerkleRoot
-            );
+            require!(is_valid_root(&merkle_root_before, &ctx.accounts.root_cache), CipherPayError::UnknownMerkleRoot);
             insert_many_roots(&[new_root1, new_root2], &mut ctx.accounts.root_cache);
 
             emit!(TransferCompleted {
@@ -299,7 +233,7 @@ pub mod cipherpay_anchor {
                     new_next_leaf_index[0], new_next_leaf_index[1],
                     new_next_leaf_index[2], new_next_leaf_index[3]
                 ]),
-                mint: Pubkey::default(), // TODO: add mint to context if needed
+                mint: Pubkey::default(), // TODO: thread mint if needed
             });
         }
 
@@ -345,7 +279,7 @@ pub mod cipherpay_anchor {
             let merkle_root   = sigs[withdraw_idx::MERKLE_ROOT];
             let recipient_pk  = sigs[withdraw_idx::RECIPIENT_WALLET_PUBKEY];
             let amount_fe     = sigs[withdraw_idx::AMOUNT];
-            let _token_id     = sigs[withdraw_idx::TOKEN_ID]; // map to mint for multi-mint support
+            let _token_id     = sigs[withdraw_idx::TOKEN_ID];
 
             require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
 
@@ -356,11 +290,9 @@ pub mod cipherpay_anchor {
 
             require!(is_valid_root(&merkle_root, &ctx.accounts.root_cache), CipherPayError::UnknownMerkleRoot);
 
-            // FE (little-endian) -> u64
+            // FE (LE) -> u64
             let mut amount: u64 = 0;
-            for i in 0..8 {
-                amount |= (amount_fe[i] as u64) << (8 * i);
-            }
+            for i in 0..8 { amount |= (amount_fe[i] as u64) << (8 * i); }
 
             // Transfer SPL from program vault ATA to recipient ATA.
             let cpi_accounts = SplTransfer {
