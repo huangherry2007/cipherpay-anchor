@@ -35,8 +35,7 @@ pub const G1_BYTES: usize = 64;
 pub const G2_BYTES: usize = 128;
 /// Groth16 proof bytes = A(G1) + B(G2) + C(G1)
 pub const PROOF_BYTES_LEN: usize = G1_BYTES + G2_BYTES + G1_BYTES; // 256
-/// BN254 field element limb size (bytes) used for publicSignals
-pub const BYTES_F: usize = 32;
+// BYTES_F is now defined in zk_verifier::solana_verifier module
 
 // =====================================================
 // Public-signal counts (must match your Circom circuits)

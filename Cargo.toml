@@ -5,12 +5,16 @@ description = "CipherPay Solana program using Anchor framework"
 edition = "2021"
 resolver = "2"                    # <<< add this
 
+[lints.rust]
+unexpected_cfgs = "allow"
+deprecated = "allow"
+
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [profile.release]
-opt-level = 3
-lto = true
+opt-level = "s"
+lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
@@ -28,6 +32,7 @@ real-crypto = []
 memo = ["spl-memo"]
 
 [dependencies]
+hex = "0.4"
 anchor-lang = "0.31.1"
 anchor-spl  = { version = "0.31.1", default-features = false, features = ["token", "token_2022", "associated_token"] }
 
@@ -40,7 +45,11 @@ sha2        = "0.10.8"
 lazy_static = "1.4"
 
 # Solana-native Groth16 verifier (replaces all Arkworks)
-groth16-solana = "0.2.0"
+groth16-solana = { version = "0.2", default-features = false }
+solana-bn254 = "2.2.2"
+
+# For offchain testing
+num-bigint = "0.4"
 
 # Optional — only if you want `spl_memo::id()` instead of a hardcoded key:
 spl-memo = { version = "4", optional = true, default-features = false }
@@ -57,3 +66,4 @@ env_logger = "0.10"
 rand = "0.8"
 
 [patch.crates-io]
+

@@ -1,3 +1,4 @@
+// src/context.rs
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
@@ -5,7 +6,7 @@ use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
 
 use crate::constants::{DEPOSIT_MARKER_SEED, NULLIFIER_SEED, VAULT_SEED};
-use crate::state::{DepositMarker, MerkleRootCache, Nullifier};
+use crate::state::*;
 
 // ---------------- Init vault PDA (authority-held mint authority elsewhere) ---------------
 #[derive(Accounts)]
@@ -56,49 +57,37 @@ pub struct DepositTokens<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-/// Atomic shielded deposit (enforces SPL transfer + memo IN THE SAME TX).
+/// Atomic deposit accounts (production)
 #[derive(Accounts)]
-#[instruction(deposit_hash: [u8; 32])]
+#[instruction(deposit_hash: Vec<u8>, proof_bytes: Vec<u8>, public_inputs_bytes: Vec<u8>)]
 pub struct ShieldedDepositAtomic<'info> {
-    /// Payer for the CPI/lamports of the new marker.
-    #[account(mut)]
+    #[account(mut, signer)]
     pub payer: Signer<'info>,
 
-    /// Rolling cache of recent Merkle roots.
     #[account(mut)]
     pub root_cache: Account<'info, MerkleRootCache>,
 
-    /// One per `deposit_hash` (idempotency). If it already exists, tx fails at init.
-    // this must MATCH the IDL:
+    // The deposit marker PDA is created once per `deposit_hash`.
     #[account(
         init,
         payer = payer,
-        seeds = [b"deposit", deposit_hash.as_ref()],   // ← include the arg
-        bump,
-        space = 8 + DepositMarker::SPACE
+        space = 8 + DepositMarker::SPACE,
+        seeds = [DEPOSIT_MARKER_SEED, deposit_hash.as_ref()],
+        bump
     )]
     pub deposit_marker: Account<'info, DepositMarker>,
 
-    /// Program’s vault PDA (authority for the vault ATA).
-    #[account(seeds = [VAULT_SEED], bump)]
-    /// CHECK: PDA authority only; used as ATA authority + signer seeds.
+    /// CHECK: program vault PDA (authority)
     pub vault_pda: UncheckedAccount<'info>,
 
-    /// Program’s vault ATA for this mint (must match the transfer seen in this tx).
-    #[account(
-        mut,
-        associated_token::mint = token_mint,
-        associated_token::authority = vault_pda
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    /// CHECK: program’s vault ATA for this mint
+    #[account(mut)]
+    pub vault_token_account: UncheckedAccount<'info>,
 
-    /// Mint of the deposited SPL token.
-    /// CHECK: We only use its key for ATA constraint & sysvar checks.
+    /// CHECK: SPL mint
     pub token_mint: UncheckedAccount<'info>,
 
-    /// Instructions sysvar (to assert memo + transfer are in this same tx).
-    /// CHECK: sysvar address is verified here.
-    #[account(address = solana_program::sysvar::instructions::ID)]
+    /// CHECK: sysvar instructions
     pub instructions: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,

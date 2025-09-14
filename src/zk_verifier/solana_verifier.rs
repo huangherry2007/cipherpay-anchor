@@ -1,461 +1,255 @@
-//! Solana-native Groth16 verification (BN254) for CipherPay.
-//! Uses the `groth16-solana` crate and Solana's altbn254 syscalls.
+//! BPF-safe Groth16 adapter using the local `groth16.rs`.
+//! - vk.bin: BIG-ENDIAN limbs (α1 | β2 | γ2 | δ2 | IC[0..n])
+//! - proof/publics on wire: LITTLE-ENDIAN 32B limbs
+//! - We convert LE→BE per 32B limb, optionally negate A.y, and (optionally) swap G2 inner limbs.
 
-use anchor_lang::prelude::*;
-use solana_program::msg;
+#![allow(clippy::needless_range_loop)]
 
-use crate::CipherPayError;
+extern crate alloc;
+use alloc::vec::Vec;
+use anchor_lang::prelude::msg;
+
+// === Use your local verifier module ===
 use groth16_solana::groth16::{Groth16Verifier, Groth16Verifyingkey};
 
-// ============================ byte sizes / layout ============================
+// If you want to sanity-print the embedded VK hash in tests/on-chain logs
+#[cfg(any(test, feature = "log_vk_hash"))]
+use solana_program::keccak::hash;
 
-const BYTES_F: usize = 32;       // field element limb
-pub const BYTES_G1: usize = 64;  // (x,y)
-pub const BYTES_G2: usize = 128; // (x.c0, x.c1, y.c0, y.c1)
-pub const BYTES_PROOF: usize = BYTES_G1 + BYTES_G2 + BYTES_G1; // 256
+// ----------------------------------------------------------------------------
+// Global mapping flags (Option A): keep these TRUE to match your SnarkJS JSON.
+// If you later bake swaps offline in your exporters, you can switch them off.
+// ----------------------------------------------------------------------------
+const NEGATE_A_Y: bool   = true; // y := (p - y) for proof.A
+const SWAP_PROOF_B: bool = true; // swap Fp2 inner limbs (c0↔c1) for proof.B
+const SWAP_VK_G2:   bool = true; // swap Fp2 inner limbs (c0↔c1) for β/γ/δ in VK
 
-// Maximum number of IC elements (upper bound sanity; not enforced here)
-pub const MAX_IC: usize = 20;
+// ---- Sizes ------------------------------------------------------------------
+pub const BYTES_F: usize = 32;
+pub const BYTES_G1: usize = 64;
+pub const BYTES_G2: usize = 128;
+pub const BYTES_PROOF: usize = BYTES_G1 + BYTES_G2 + BYTES_G1;
+pub const MAX_IC: usize = 64;
 
-// ============================= circuit metadata =============================
+// ---- Circuit-specific public counts ----------------------------------------
+// From compile logs (public inputs + public outputs)
+pub const DEPOSIT_N_PUBLIC: usize  = 6; // 2 in + 4 out
+pub const TRANSFER_N_PUBLIC: usize = 9; // 2 in + 7 out
+pub const WITHDRAW_N_PUBLIC: usize = 5; // 3 in + 2 out
 
-pub const DEPOSIT_N_PUBLIC: usize = 6; // [newCommitment, ownerCipherPayPubKey, newMerkleRoot, newNextLeafIndex, amount, depositHash]
-pub const TRANSFER_N_PUBLIC: usize = 9;
-pub const WITHDRAW_N_PUBLIC: usize = 5;
-
+// ---- Public signal indices (adjust if your order differs) -------------------
 pub mod deposit_idx {
-    pub const NEW_COMMITMENT: usize = 0;
+    pub const NEW_COMMITMENT: usize         = 0;
     pub const OWNER_CIPHERPAY_PUBKEY: usize = 1;
-    pub const NEW_MERKLE_ROOT: usize = 2;
-    pub const NEW_NEXT_LEAF_INDEX: usize = 3;
-    pub const AMOUNT: usize = 4;
-    pub const DEPOSIT_HASH: usize = 5;
+    pub const NEW_MERKLE_ROOT: usize        = 2;
+    pub const NEW_NEXT_LEAF_INDEX: usize    = 3;
+    pub const AMOUNT: usize                 = 4;
+    pub const DEPOSIT_HASH: usize           = 5;
 }
 pub mod transfer_idx {
-    pub const OUT_COMMITMENT1: usize = 0;
-    pub const OUT_COMMITMENT2: usize = 1;
-    pub const NULLIFIER: usize = 2;
-    pub const MERKLE_ROOT: usize = 3;
-    pub const NEW_MERKLE_ROOT1: usize = 4;
-    pub const NEW_MERKLE_ROOT2: usize = 5;
-    pub const NEW_NEXT_LEAF_IDX: usize = 6;
-    pub const ENC_NOTE1_HASH: usize = 7;
-    pub const ENC_NOTE2_HASH: usize = 8;
+    pub const OUT_COMMITMENT_1:    usize = 0;
+    pub const OUT_COMMITMENT_2:    usize = 1;
+    pub const NULLIFIER:           usize = 2;
+    pub const MERKLE_ROOT:         usize = 3;
+    pub const NEW_MERKLE_ROOT_1:   usize = 4;
+    pub const NEW_MERKLE_ROOT_2:   usize = 5;
+    pub const NEW_NEXT_LEAF_INDEX: usize = 6;
+    pub const ENC_NOTE1_HASH:      usize = 7;
+    pub const ENC_NOTE2_HASH:      usize = 8;
 }
 pub mod withdraw_idx {
-    pub const NULLIFIER: usize = 0;
-    pub const MERKLE_ROOT: usize = 1;
+    // Order used in your withdraw public signals (5 x 32B LE limbs)
+    pub const NULLIFIER: usize               = 0;
+    pub const MERKLE_ROOT: usize             = 1;
     pub const RECIPIENT_WALLET_PUBKEY: usize = 2;
-    pub const AMOUNT: usize = 3;
-    pub const TOKEN_ID: usize = 4;
+    pub const AMOUNT: usize                  = 3;
+    pub const TOKEN_ID: usize                = 4;
 }
 
-// Verifying key blobs (must be generated with the crate’s parse-vk tool; BE limbs, correct limb order)
-pub const DEPOSIT_VK_BIN: &[u8] = include_bytes!("deposit_vk.bin");
-pub const TRANSFER_VK_BIN: &[u8] = include_bytes!("transfer_vk.bin");
-pub const WITHDRAW_VK_BIN: &[u8] = include_bytes!("withdraw_vk.bin");
-
-// =============================== endian helpers =============================
-
-/// Reverse a single 32-byte limb (LE <-> BE).
-#[inline]
-fn rev32(input: &[u8; 32]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = input[31 - i];
-    }
-    out
-}
-
-/// Convert a G1 point from LE limbs on the wire to BE limbs (x||y), per 32-byte limb.
-#[inline]
-fn le_g1_to_be(g1_le: &[u8; 64]) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&rev32(g1_le[..32].try_into().unwrap()));
-    out[32..].copy_from_slice(&rev32(g1_le[32..].try_into().unwrap()));
-    out
-}
-
-/// Convert a G2 point from LE limbs on the wire to BE limbs (x.c0, x.c1, y.c0, y.c1),
-/// reversing each 32-byte limb.
-#[inline]
-fn le_g2_to_be(g2_le: &[u8; 128]) -> [u8; 128] {
-    let mut out = [0u8; 128];
-    for i in 0..4 {
-        let start = i * 32;
-        out[start..start + 32].copy_from_slice(&rev32(g2_le[start..start + 32].try_into().unwrap()));
-    }
-    out
-}
-
-// =============================== math helpers ===============================
-
-// BN254 base field modulus (Fq) in big-endian bytes:
-const FQ_MODULUS_BE: [u8; 32] = [
-    0x30, 0x64, 0x4E, 0x72, 0xE1, 0x31, 0xA0, 0x29, 0xB8, 0x50, 0x45, 0xB6, 0x81, 0x81, 0x58, 0x5D,
-    0x97, 0x81, 0x6A, 0x91, 0x68, 0x71, 0xCA, 0x8D, 0x3C, 0x20, 0x8C, 0x16, 0xD8, 0x7C, 0xFD, 0x47,
+// -------------------- Little helpers (LE/BE & math) -------------------------
+const BN254_FQ_MOD_BE: [u8; 32] = [
+    0x30,0x64,0x4e,0x72,0xe1,0x31,0xa0,0x29,0xb8,0x50,0x45,0xb6,0x81,0x81,0x58,0x5d,
+    0x97,0x81,0x6a,0x91,0x68,0x71,0xca,0x8d,0x3c,0x20,0x8c,0x16,0xd8,0x7c,0xfd,0x47,
 ];
 
 #[inline]
-fn is_zero32(x: &[u8; 32]) -> bool {
-    x.iter().all(|&b| b == 0)
-}
-
-#[inline]
-fn be_sub_32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    // returns (a - b) mod 2^256 (caller ensures a >= b over Fq range)
+fn le32_to_be32(le: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
+    for i in 0..32 { out[i] = le[31 - i]; }
+    out
+}
+#[inline]
+fn le64_to_be64_xy(le: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&le32_to_be32(&le[..32]));
+    out[32..].copy_from_slice(&le32_to_be32(&le[32..64]));
+    out
+}
+/// y := (p - y) mod p  (big-endian limb). If y == 0, keep 0.
+fn negate_fq_be_in_place(y: &mut [u8; 32]) {
+    if y.iter().all(|&b| b == 0) { return; }
     let mut borrow = 0u16;
     for i in (0..32).rev() {
-        let ai = a[i] as u16;
-        let bi = b[i] as u16;
-        let tmp = ai.wrapping_sub(bi).wrapping_sub(borrow);
-        borrow = if ai < bi + borrow { 1 } else { 0 };
-        out[i] = (tmp & 0xFF) as u8;
+        let p = BN254_FQ_MOD_BE[i] as i16;
+        let yi = y[i] as i16;
+        let mut diff = p as i32 - yi as i32 - borrow as i32;
+        if diff < 0 { diff += 256; borrow = 1; } else { borrow = 0; }
+        y[i] = diff as u8;
     }
-    out
 }
 
-/// Negate a BE G1 point (x||y) -> (x||-y) in BN254 (special case y=0 -> 0).
-#[inline]
-fn negate_g1_a_be(a_be: &[u8; BYTES_G1]) -> [u8; BYTES_G1] {
-    let (x, y) = a_be.split_at(32);
-    let mut out = [0u8; BYTES_G1];
-    out[..32].copy_from_slice(x);
-    let y32: [u8; 32] = y.try_into().unwrap();
-    let y_neg = if is_zero32(&y32) { y32 } else { be_sub_32(&FQ_MODULUS_BE, &y32) };
-    out[32..].copy_from_slice(&y_neg);
-    out
-}
-
-// =============================== core helpers ===============================
-
-/// Parse proof = A||B||C with sizes (64,128,64) — *no endianness change here*.
-pub fn parse_proof_bytes(bytes: &[u8]) -> Result<([u8; BYTES_G1], [u8; BYTES_G2], [u8; BYTES_G1])> {
-    if bytes.len() != BYTES_PROOF {
-        return Err(CipherPayError::InvalidZkProof.into());
+// ---- Public inputs & proof (LE on wire) ------------------------------------
+pub fn parse_public_signals_exact(bytes: &[u8]) -> Result<Vec<[u8; 32]>, &'static str> {
+    if bytes.len() % BYTES_F != 0 { return Err("public inputs len not multiple of 32"); }
+    let mut out = Vec::with_capacity(bytes.len() / 32);
+    for i in (0..bytes.len()).step_by(32) {
+        out.push(bytes[i..i+32].try_into().map_err(|_| "bad 32B slice")?);
     }
-    let mut a = [0u8; BYTES_G1];
-    let mut b = [0u8; BYTES_G2];
-    let mut c = [0u8; BYTES_G1];
-    a.copy_from_slice(&bytes[0..BYTES_G1]);
-    b.copy_from_slice(&bytes[BYTES_G1..BYTES_G1 + BYTES_G2]);
-    c.copy_from_slice(&bytes[BYTES_G1 + BYTES_G2..BYTES_PROOF]);
+    Ok(out)
+}
+pub fn extract_public_input(bytes: &[u8], idx: usize) -> Result<[u8; 32], &'static str> {
+    bytes.get(idx*BYTES_F .. (idx+1)*BYTES_F)
+        .ok_or("index OOB")
+        .and_then(|s| s.try_into().map_err(|_| "bad 32B"))
+}
+pub fn parse_proof_bytes(proof_le: &[u8]) -> Result<(&[u8; 64], &[u8; 128], &[u8; 64]), &'static str> {
+    if proof_le.len() != BYTES_PROOF { return Err("bad proof len"); }
+    let a = proof_le.get(0..64).ok_or("OOB")?.try_into().map_err(|_| "bad 64B")?;
+    let b = proof_le.get(64..192).ok_or("OOB")?.try_into().map_err(|_| "bad 128B")?;
+    let c = proof_le.get(192..256).ok_or("OOB")?.try_into().map_err(|_| "bad 64B")?;
     Ok((a, b, c))
 }
 
-/// Parse bytes into N 32B limbs (no conversion).
-pub fn parse_public_signals_exact(bytes: &[u8]) -> Result<Vec<[u8; BYTES_F]>> {
-    if bytes.len() % BYTES_F != 0 {
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-    let n = bytes.len() / BYTES_F;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut limb = [0u8; BYTES_F];
-        limb.copy_from_slice(&bytes[i * BYTES_F..(i + 1) * BYTES_F]);
-        out.push(limb);
-    }
-    Ok(out)
+// ---- VK.bin parsing (BE on disk) -------------------------------------------
+fn ic_count_from_vk(vk_be: &[u8]) -> Result<usize, &'static str> {
+    if vk_be.len() < BYTES_G1 + 3*BYTES_G2 + BYTES_G1 { return Err("vk too short"); }
+    let rem = vk_be.len() - (BYTES_G1 + 3*BYTES_G2);
+    if rem % BYTES_G1 != 0 { return Err("IC remainder not multiple of 64"); }
+    Ok(rem / BYTES_G1)
 }
 
-/// Same as above but returns a fixed-size array for const-generic verifier.
-fn parse_public_signals_array<const N: usize>(bytes: &[u8]) -> Result<[[u8; BYTES_F]; N]> {
-    if bytes.len() != N * BYTES_F {
-        return Err(CipherPayError::InvalidZkProof.into());
+/// Return (alpha, beta, gamma, delta, IC_vec)
+fn parse_vk_parts(vk_be: &[u8]) -> Result<([u8;64],[u8;128],[u8;128],[u8;128], Vec<[u8;64]>), &'static str> {
+    let ic = ic_count_from_vk(vk_be)?;
+    let mut off = 0usize;
+    let mut take = |n: usize| -> Result<&[u8], &'static str> {
+        if off + n > vk_be.len() { return Err("vk parse OOB"); }
+        let s = &vk_be[off .. off+n]; off += n; Ok(s)
+    };
+    let mut alpha = [0u8; 64]; alpha.copy_from_slice(take(BYTES_G1)?);
+    let mut beta  = [0u8;128]; beta .copy_from_slice(take(BYTES_G2)?);
+    let mut gamma = [0u8;128]; gamma.copy_from_slice(take(BYTES_G2)?);
+    let mut delta = [0u8;128]; delta.copy_from_slice(take(BYTES_G2)?);
+
+    let mut ic_vec: Vec<[u8;64]> = Vec::with_capacity(ic);
+    for _ in 0..ic {
+        let mut g1 = [0u8; 64];
+        g1.copy_from_slice(take(BYTES_G1)?);
+        ic_vec.push(g1);
     }
-    let mut out = [[0u8; BYTES_F]; N];
+    Ok((alpha, beta, gamma, delta, ic_vec))
+}
+
+// ---- G2 limb swap for B / VK (BE) ------------------------------------------
+fn swap32_in_place(slice: &mut [u8], i: usize, j: usize) {
+    debug_assert!(i + 32 <= j); // we only call with (0,32) and (64,96)
+    let (left, right) = slice.split_at_mut(j);
+    let (li, r0) = (&mut left[i .. i+32], &mut right[0 .. 32]);
+    let mut tmp = [0u8; 32];
+    tmp.copy_from_slice(li);
+    li.copy_from_slice(r0);
+    r0.copy_from_slice(&tmp);
+}
+fn swap_g2_inner_limbs_be(mut b: [u8; 128]) -> [u8; 128] {
+    // x: [0..32]=c0, [32..64]=c1 ; y: [64..96]=c0, [96..128]=c1
+    swap32_in_place(&mut b, 0, 32);
+    swap32_in_place(&mut b, 64, 96);
+    b
+}
+
+// -------------------- Core verify (const-generic N) -------------------------
+fn verify_once_const<const N: usize>(vk_be: &[u8], proof_le: &[u8], public_le: &[u8]) -> Result<(), &'static str> {
+    if proof_le.len() != BYTES_PROOF { return Err("proof must be 256 bytes"); }
+    if public_le.len() != N * BYTES_F { return Err("public inputs length mismatch"); }
+
+    // 1) Parse VK parts and build a VK struct that borrows the IC slice
+    let (alpha, beta0, gamma0, delta0, ic_vec) = parse_vk_parts(vk_be)?;
+
+    #[cfg(any(test, feature = "log_vk_hash"))]
+    {
+        let digest = hash(vk_be);
+        msg!("vk.bin keccak256 = {:?}", digest.0);
+    }
+
+    msg!("parse_verifying_key: IC count = {}", ic_vec.len());
+    if ic_vec.len() != N + 1 { return Err("vk.ic count != N+1"); }
+    if ic_vec.len() > MAX_IC { return Err("vk.ic too large"); }
+
+    let beta  = if SWAP_VK_G2 { swap_g2_inner_limbs_be(beta0)  } else { beta0  };
+    let gamma = if SWAP_VK_G2 { swap_g2_inner_limbs_be(gamma0) } else { gamma0 };
+    let delta = if SWAP_VK_G2 { swap_g2_inner_limbs_be(delta0) } else { delta0 };
+
+    let vk = Groth16Verifyingkey {
+        nr_pubinputs: ic_vec.len().saturating_sub(1),
+        vk_alpha_g1: alpha,
+        vk_beta_g2:  beta,
+        vk_gamme_g2: gamma, // spelling as defined in your groth16.rs
+        vk_delta_g2: delta,
+        vk_ic: &ic_vec,
+    };
+
+    // 2) Convert publics LE -> BE array
+    let mut publics_vec: Vec<[u8; 32]> = Vec::with_capacity(N);
     for i in 0..N {
-        out[i].copy_from_slice(&bytes[i * BYTES_F..(i + 1) * BYTES_F]);
+        publics_vec.push(le32_to_be32(&public_le[i*32 .. (i+1)*32]));
     }
-    Ok(out)
+    let publics: &[[u8;32]; N] = publics_vec.as_slice().try_into().map_err(|_| "publics slice to array failed")?;
+
+    // 3) Build A,B,C in BE according to mapping flags
+    let (a_le, b_le, c_le) = parse_proof_bytes(proof_le)?;
+
+    // A BE & optional negate y
+    let mut a_be = le64_to_be64_xy(a_le);
+    if NEGATE_A_Y {
+        let mut ay = [0u8; 32];
+        ay.copy_from_slice(&a_be[32..64]);
+        negate_fq_be_in_place(&mut ay);
+        a_be[32..64].copy_from_slice(&ay);
+    }
+
+    // B BE
+    let mut b_be = [0u8; 128];
+    b_be[  0.. 32].copy_from_slice(&le32_to_be32(&b_le[ 0.. 32]));
+    b_be[ 32.. 64].copy_from_slice(&le32_to_be32(&b_le[32.. 64]));
+    b_be[ 64.. 96].copy_from_slice(&le32_to_be32(&b_le[64.. 96]));
+    b_be[ 96..128].copy_from_slice(&le32_to_be32(&b_le[96..128]));
+    if SWAP_PROOF_B { b_be = swap_g2_inner_limbs_be(b_be); }
+
+    // C BE
+    let c_be = le64_to_be64_xy(c_le);
+
+    // 4) Verify
+    let mut verifier = Groth16Verifier::<N>::new(&a_be, &b_be, &c_be, publics, &vk)
+        .map_err(|_| "verifier new failed")?;
+    verifier.verify().map_err(|_| "ProofVerificationFailed")
 }
 
-/// Read a specific public input (bounds-checked).
-#[inline]
-pub fn extract_public_input(public_inputs: &[[u8; BYTES_F]], index: usize) -> Result<[u8; BYTES_F]> {
-    public_inputs.get(index).cloned().ok_or(CipherPayError::InvalidZkProof.into())
+// -------------------- Public wrappers per circuit ---------------------------
+const DEPOSIT_VK_BIN:  &[u8] = include_bytes!("deposit_vk.bin");
+const TRANSFER_VK_BIN: &[u8] = include_bytes!("transfer_vk.bin");
+const WITHDRAW_VK_BIN: &[u8] = include_bytes!("withdraw_vk.bin");
+
+pub fn verify_deposit(proof_le: &[u8], public_le: &[u8]) -> Result<(), &'static str> {
+    verify_once_const::<{ DEPOSIT_N_PUBLIC }>(DEPOSIT_VK_BIN, proof_le, public_le)
+}
+pub fn verify_transfer(proof_le: &[u8], public_le: &[u8]) -> Result<(), &'static str> {
+    verify_once_const::<{ TRANSFER_N_PUBLIC }>(TRANSFER_VK_BIN, proof_le, public_le)
+}
+pub fn verify_withdraw(proof_le: &[u8], public_le: &[u8]) -> Result<(), &'static str> {
+    verify_once_const::<{ WITHDRAW_N_PUBLIC }>(WITHDRAW_VK_BIN, proof_le, public_le)
 }
 
-/// Convenience for small amounts encoded in the first 8 bytes (LE).
-#[inline]
-pub fn extract_amount_u64(public_inputs: &[[u8; BYTES_F]], index: usize) -> Result<u64> {
-    let limb = extract_public_input(public_inputs, index)?;
-    let mut x = 0u64;
-    for i in 0..8 {
-        x |= (limb[i] as u64) << (8 * i);
-    }
-    Ok(x)
-}
-
-/// Parse public inputs from bytes (legacy helper).
-pub fn parse_public_inputs(bytes: &[u8], expected_count: usize) -> Result<Vec<[u8; BYTES_F]>> {
-    if bytes.len() != expected_count * BYTES_F {
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-    let mut inputs = Vec::with_capacity(expected_count);
-    for i in 0..expected_count {
-        let mut input = [0u8; BYTES_F];
-        let start = i * BYTES_F;
-        input.copy_from_slice(&bytes[start..start + BYTES_F]);
-        inputs.push(input);
-    }
-    Ok(inputs)
-}
-
-// ========================== verifying key deserializer =======================
-//
-// The groth16-solana VK struct wants BE limbs for:
-//   - alpha_g1 (64B), beta_g2 (128B), gamma_g2 (128B), delta_g2 (128B)
-//   - vk_ic: &'static [[u8; 64]]  (G1 IC points)
-// Make sure your *binary vk* comes from the crate’s parse-vk tool.
-//
-
-pub fn parse_verifying_key(vk_bytes: &[u8]) -> Result<Groth16Verifyingkey> {
-    let min_size = BYTES_G1 + 3 * BYTES_G2 + BYTES_G1;
-    if vk_bytes.len() < min_size {
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-
-    let mut off = 0;
-
-    let mut vk_alpha_g1 = [0u8; BYTES_G1];
-    vk_alpha_g1.copy_from_slice(&vk_bytes[off..off + BYTES_G1]);
-    off += BYTES_G1;
-
-    let mut vk_beta_g2 = [0u8; BYTES_G2];
-    vk_beta_g2.copy_from_slice(&vk_bytes[off..off + BYTES_G2]);
-    off += BYTES_G2;
-
-    let mut vk_gamma_g2 = [0u8; BYTES_G2];
-    vk_gamma_g2.copy_from_slice(&vk_bytes[off..off + BYTES_G2]);
-    off += BYTES_G2;
-
-    let mut vk_delta_g2 = [0u8; BYTES_G2];
-    vk_delta_g2.copy_from_slice(&vk_bytes[off..off + BYTES_G2]);
-    off += BYTES_G2;
-
-    let ic_bytes = &vk_bytes[off..];
-    let ic_count = ic_bytes.len() / BYTES_G1;
-    if ic_count == 0 || ic_count > MAX_IC {
-        msg!("parse_verifying_key: invalid IC count: 0 or > {}", MAX_IC);
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-    msg!("parse_verifying_key: IC count = {}", ic_count);
-
-    // Build 'static vk_ic
-    let mut vk_ic_vec: Vec<[u8; BYTES_G1]> = Vec::with_capacity(ic_count);
-    for i in 0..ic_count {
-        let mut arr = [0u8; BYTES_G1];
-        let start = i * BYTES_G1;
-        if start + BYTES_G1 > ic_bytes.len() {
-            msg!("parse_verifying_key: IC element {} out of bounds", i);
-            return Err(CipherPayError::InvalidZkProof.into());
-        }
-        arr.copy_from_slice(&ic_bytes[start..start + BYTES_G1]);
-        vk_ic_vec.push(arr);
-    }
-    let vk_ic_static: &'static [[u8; BYTES_G1]] = Box::leak(vk_ic_vec.into_boxed_slice());
-
-    Ok(Groth16Verifyingkey {
-        nr_pubinputs: ic_count - 1,
-        vk_alpha_g1,
-        vk_beta_g2,
-        vk_gamme_g2: vk_gamma_g2, // NOTE: field name as defined in the crate
-        vk_delta_g2,
-        vk_ic: vk_ic_static,
-    })
-}
-
-// ============================== verification API ============================
-
-/// Core verifier: accepts proof parts (BE), *LE* public inputs (we convert to BE), and VK bytes.
-/// Const-generic over the number of public inputs so it matches the VK.
-/// NOTE: groth16-solana expects **-A**; we negate Y coordinate byte-wise.
-pub fn verify_groth16_proof<const N: usize>(
-    proof_a_be: &[u8; BYTES_G1],
-    proof_b_be: &[u8; BYTES_G2],
-    proof_c_be: &[u8; BYTES_G1],
-    public_inputs_le: &[[u8; BYTES_F]; N],
-    verifying_key_bytes: &[u8],
-) -> Result<()> {
-    msg!("verify_groth16_proof: starting verification");
-    msg!("verify_groth16_proof: public_inputs.len() = {}", N);
-    msg!("verify_groth16_proof: verifying_key_bytes.len() = {}", verifying_key_bytes.len());
-
-    // Parse VK (BE limbs)
-    let vk = parse_verifying_key(verifying_key_bytes)?;
-    msg!("verify_groth16_proof: verifying key parsed successfully");
-
-    if N != vk.nr_pubinputs {
-        msg!(
-            "verify_groth16_proof: inputs mismatch: got {}, vk expects {}",
-            N,
-            vk.nr_pubinputs
-        );
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-
-    // Convert public inputs LE -> BE (canonical 32B)
-    let mut public_inputs_be = [[0u8; BYTES_F]; N];
-    for i in 0..N {
-        public_inputs_be[i] = rev32(&public_inputs_le[i]);
-    }
-    msg!("verify_groth16_proof: converted public inputs LE->BE");
-
-    // Negate A (A -> -A) at byte level: (x, y) -> (x, p - y), with -0 = 0
-    let a_neg_be = negate_g1_a_be(proof_a_be);
-
-    // Build verifier
-    msg!(
-        "verify_groth16_proof: vk.nr_pubinputs = {}, vk.vk_ic.len() = {}",
-        vk.nr_pubinputs,
-        vk.vk_ic.len()
-    );
-
-    let mut verifier = Groth16Verifier::new(&a_neg_be, proof_b_be, proof_c_be, &public_inputs_be, &vk)
-        .map_err(|e| {
-            msg!("verify_groth16_proof: Groth16Verifier::new failed: {:?}", e);
-            CipherPayError::InvalidZkProof
-        })?;
-    msg!("verify_groth16_proof: Groth16Verifier created successfully");
-
-    // Verify
-    msg!("verify_groth16_proof: calling verifier.verify()...");
-    verifier.verify().map_err(|e| {
-        msg!("verify_groth16_proof: verifier.verify() failed: {:?}", e);
-        CipherPayError::InvalidZkProof
-    })?;
-    msg!("verify_groth16_proof: verification successful!");
-    Ok(())
-}
-
-/// Verify a payload = [proof(256) || public_signals(N * 32)].
-/// Proof parts are **LE on the wire** (we flip to BE here); public signals are **LE on the wire**.
-pub fn verify_groth16_payload<const N: usize>(payload: &[u8], verifying_key_bytes: &[u8]) -> Result<()> {
-    let needed = BYTES_PROOF + N * BYTES_F;
-    if payload.len() != needed {
-        msg!("payload length {} != expected {}", payload.len(), needed);
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-
-    let (proof, sigs_bytes) = payload.split_at(BYTES_PROOF);
-    let (a_le, b_le, c_le) = parse_proof_bytes(proof)?; // LE split only
-
-    // Flip proof limbs to BE for groth16-solana
-    let a_be = le_g1_to_be(&a_le);
-    let b_be = le_g2_to_be(&b_le);
-    let c_be = le_g1_to_be(&c_le);
-
-    // Public signals are LE on wire (we flip inside verify_groth16_proof)
-    let sigs_le = parse_public_signals_array::<N>(sigs_bytes)?;
-    verify_groth16_proof::<N>(&a_be, &b_be, &c_be, &sigs_le, verifying_key_bytes)
-}
-
-// ============================== nice wrappers ===============================
-
-#[inline]
-pub fn verify_deposit_payload(payload: &[u8]) -> Result<()> {
-    verify_groth16_payload::<{ DEPOSIT_N_PUBLIC }>(payload, DEPOSIT_VK_BIN)
-}
-
-#[inline]
-pub fn verify_transfer_payload(payload: &[u8]) -> Result<()> {
-    verify_groth16_payload::<{ TRANSFER_N_PUBLIC }>(payload, TRANSFER_VK_BIN)
-}
-
-#[inline]
-pub fn verify_withdraw_payload(payload: &[u8]) -> Result<()> {
-    verify_groth16_payload::<{ WITHDRAW_N_PUBLIC }>(payload, WITHDRAW_VK_BIN)
-}
-
-#[inline]
-pub fn verify_deposit(proof_bytes: &[u8], public_signals_bytes: &[u8]) -> Result<()> {
-    msg!(
-        "verify_deposit: proof_bytes.len() = {}, public_signals_bytes.len() = {}",
-        proof_bytes.len(),
-        public_signals_bytes.len()
-    );
-
-    if public_signals_bytes.len() != DEPOSIT_N_PUBLIC * BYTES_F {
-        msg!(
-            "deposit: unexpected public signals length: {} != {}",
-            public_signals_bytes.len(),
-            DEPOSIT_N_PUBLIC * BYTES_F
-        );
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-
-    let (a_le, b_le, c_le) = parse_proof_bytes(proof_bytes)?; // LE
-    let a_be = le_g1_to_be(&a_le);
-    let b_be = le_g2_to_be(&b_le);
-    let c_be = le_g1_to_be(&c_le);
-
-    let sigs_le = parse_public_signals_array::<{ DEPOSIT_N_PUBLIC }>(public_signals_bytes)?;
-    verify_groth16_proof::<{ DEPOSIT_N_PUBLIC }>(&a_be, &b_be, &c_be, &sigs_le, DEPOSIT_VK_BIN)
-}
-
-#[inline]
-pub fn verify_transfer(proof_bytes: &[u8], public_signals_bytes: &[u8]) -> Result<()> {
-    if public_signals_bytes.len() != TRANSFER_N_PUBLIC * BYTES_F {
-        msg!("transfer: unexpected public signals length");
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-
-    let (a_le, b_le, c_le) = parse_proof_bytes(proof_bytes)?; // LE
-    let a_be = le_g1_to_be(&a_le);
-    let b_be = le_g2_to_be(&b_le);
-    let c_be = le_g1_to_be(&c_le);
-
-    let sigs_le = parse_public_signals_array::<{ TRANSFER_N_PUBLIC }>(public_signals_bytes)?;
-    verify_groth16_proof::<{ TRANSFER_N_PUBLIC }>(&a_be, &b_be, &c_be, &sigs_le, TRANSFER_VK_BIN)
-}
-
-#[inline]
-pub fn verify_withdraw(proof_bytes: &[u8], public_signals_bytes: &[u8]) -> Result<()> {
-    if public_signals_bytes.len() != WITHDRAW_N_PUBLIC * BYTES_F {
-        msg!("withdraw: unexpected public signals length");
-        return Err(CipherPayError::InvalidZkProof.into());
-    }
-
-    let (a_le, b_le, c_le) = parse_proof_bytes(proof_bytes)?; // LE
-    let a_be = le_g1_to_be(&a_le);
-    let b_be = le_g2_to_be(&b_le);
-    let c_be = le_g1_to_be(&c_le);
-
-    let sigs_le = parse_public_signals_array::<{ WITHDRAW_N_PUBLIC }>(public_signals_bytes)?;
-    verify_groth16_proof::<{ WITHDRAW_N_PUBLIC }>(&a_be, &b_be, &c_be, &sigs_le, WITHDRAW_VK_BIN)
-}
-
-// =================================== tests ==================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn proof_split_lengths_ok() {
-        let p = vec![0u8; BYTES_PROOF];
-        let (a, b, c) = parse_proof_bytes(&p).unwrap();
-        assert_eq!(a.len(), BYTES_G1);
-        assert_eq!(b.len(), BYTES_G2);
-        assert_eq!(c.len(), BYTES_G1);
-    }
-
-    #[test]
-    fn signals_parse_ok() {
-        let mut limbs = vec![0u8; 3 * BYTES_F];
-        limbs[0] = 1;
-        let v = parse_public_signals_exact(&limbs).unwrap();
-        assert_eq!(v.len(), 3);
-        assert_eq!(v[0][0], 1);
-    }
-
-    #[test]
-    fn amount_le_ok() {
-        let mut limb = [0u8; BYTES_F];
-        limb[0] = 100;
-        let v = vec![limb];
-        assert_eq!(extract_amount_u64(&v, 0).unwrap(), 100);
-    }
-}
+// Thin shims if your crate calls these names
+pub fn verify_deposit_payload(p: &[u8], s: &[u8]) -> Result<(), &'static str> { verify_deposit(p, s) }
+pub fn verify_transfer_payload(p: &[u8], s: &[u8]) -> Result<(), &'static str> { verify_transfer(p, s) }
+pub fn verify_withdraw_payload(p: &[u8], s: &[u8]) -> Result<(), &'static str> { verify_withdraw(p, s) }

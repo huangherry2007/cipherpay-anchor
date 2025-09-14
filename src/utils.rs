@@ -1,160 +1,176 @@
+// src/utils.rs
+#![allow(unexpected_cfgs)]
+#![allow(dead_code)]
+
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::pubkey::Pubkey;
 use anchor_lang::solana_program::{
-    sysvar::instructions::{
-        load_instruction_at_checked,
-    },
+    instruction::Instruction,
+    sysvar::instructions as sysvar_instructions,
 };
-use anchor_spl::token::spl_token;
+use core::str::FromStr;
 
-use crate::state::MerkleRootCache;
 use crate::error::CipherPayError;
+use crate::state::MerkleRootCache;
 
-/// Require that a Memo instruction exists in this tx with data == `expected` (byte-for-byte).
-pub fn assert_memo_in_same_tx(ix_sysvar: &UncheckedAccount, expected: &[u8]) -> Result<()> {
-    let info = ix_sysvar.to_account_info();
-    // Iterate instructions until out-of-range
-    let mut i = 0usize;
-    loop {
-        match load_instruction_at_checked(i, &info) {
-            Ok(_compiled) => {
-                // Resolve into `Instruction` so we can read `program_id` & `data`
-                let ix = load_instruction_at_checked(i, &info)
-                    .map_err(|_| error!(CipherPayError::MemoMissing))?;
-                // Use hardcoded memo program ID to avoid linking conflicts
-                const MEMO_PROGRAM_ID: [u8; 32] = [
-                    5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                ];
-                if ix.program_id == Pubkey::from(MEMO_PROGRAM_ID) && ix.data.as_slice() == expected {
-                    return Ok(());
-                }
-                i += 1;
-            }
-            Err(_) => break, // end of list
-        }
-    }
-    Err(error!(CipherPayError::MemoMissing))
+/// SPL Token program (from anchor_spl)
+use anchor_spl::token::ID as TOKEN_PROGRAM_ID;
+
+/// ───────────────────────── logging gate ─────────────────────────
+/// Enable lightweight tracing with: `--features verbose-logs`
+#[cfg(feature = "verbose-logs")]
+macro_rules! trace { ($($arg:tt)*) => { msg!($($arg)*); } }
+#[cfg(not(feature = "verbose-logs"))]
+macro_rules! trace { ($($arg:tt)*) => {}; }
+
+/// Load instruction `i` from the sysvar, mapped to a clean Anchor error.
+fn load_ix_at(i: usize, instr_ai: &AccountInfo) -> Result<Instruction> {
+    sysvar_instructions::load_instruction_at_checked(i, instr_ai)
+        .map_err(|_| error!(CipherPayError::InvalidInput))
 }
 
-/// Require an SPL Token Transfer/TransferChecked to `dest_ata` for `expected_amount`.
+/// Index of the currently-executing instruction in the transaction.
+fn current_index(instr_ai: &AccountInfo) -> Result<usize> {
+    sysvar_instructions::load_current_index_checked(instr_ai)
+        .map(|x| x as usize)
+        .map_err(|_| error!(CipherPayError::InvalidInput))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Accept either raw 32B memo (exact bytes) or the string form: "deposit:<hex-le>"
+pub fn assert_memo_in_same_tx(
+    instr_ai: &AccountInfo,
+    expected_hash_le: &[u8; 32],
+) -> Result<()> {
+    let cur = current_index(instr_ai)?;
+    let want_str = {
+        let mut s = String::from("deposit:");
+        s.push_str(&hex_lower(expected_hash_le));
+        s
+    };
+    let memo_pid = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+        .map_err(|_| error!(CipherPayError::InvalidInput))?;
+
+    trace!("memo: scanning 0..={}", cur);
+    for i in 0..=cur {
+        let ix = load_ix_at(i, instr_ai)?;
+        if ix.program_id != memo_pid {
+            continue;
+        }
+        // raw 32B match OR utf8 == "deposit:<hex>"
+        let raw_ok = ix.data.as_slice() == expected_hash_le;
+        let str_ok = core::str::from_utf8(&ix.data)
+            .map(|s| s == want_str)
+            .unwrap_or(false);
+
+        trace!("memo@{i}: raw_ok={} str_ok={}", raw_ok, str_ok);
+        if raw_ok || str_ok {
+            return Ok(());
+        }
+    }
+
+    // Use an existing error variant (no extra enum changes needed).
+    Err(error!(CipherPayError::InvalidInput))
+}
+
+/// Minimal decoder for SPL-Token amounts:
+/// tag=3  -> Transfer { amount: u64 }
+/// tag=12 -> TransferChecked { amount: u64, decimals: u8 }
+fn parse_spl_token_amount(data: &[u8]) -> Option<(u8, u64, Option<u8>)> {
+    if data.is_empty() { return None; }
+    match data[0] {
+        3 => {
+            if data.len() < 1 + 8 { return None; }
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&data[1..1+8]);
+            Some((3, u64::from_le_bytes(le), None))
+        }
+        12 => {
+            if data.len() < 1 + 8 + 1 { return None; }
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&data[1..1+8]);
+            Some((12, u64::from_le_bytes(le), Some(data[1+8])))
+        }
+        _ => None,
+    }
+}
+
+/// Search 0..=current_index for a Transfer/TransferChecked to `expected_dst`.
+/// If `expected_amount == 0`, treat amount as a wildcard (useful in non-crypto builds).
 pub fn assert_transfer_checked_in_same_tx(
-    ix_sysvar: &UncheckedAccount,
-    dest_ata: &Pubkey,
+    instr_ai: &AccountInfo,
+    expected_dst: &Pubkey,
     expected_amount: u64,
 ) -> Result<()> {
-    let info = ix_sysvar.to_account_info();
-    let mut i = 0usize;
+    let cur = current_index(instr_ai)?;
+    trace!(
+        "spl: want dst={} amount={} (wildcard_if_zero={})",
+        expected_dst, expected_amount, expected_amount == 0
+    );
 
-    while let Ok(_) = load_instruction_at_checked(i, &info) {
-        let ix = load_instruction_at_checked(i, &info)
-            .map_err(|_| error!(CipherPayError::RequiredSplTransferMissing))?;
-
-        if ix.program_id == spl_token::ID {
-            // SPL Token instruction tags
-            //   3  = Transfer{ amount: u64 }
-            //   12 = TransferChecked{ amount: u64, decimals: u8 }
-            if let Some((&tag, rest)) = ix.data.split_first() {
-                match tag {
-                    3 => {
-                        // accounts: [source, destination, authority, ...]
-                        if ix.accounts.len() >= 2 {
-                            let mut amt = [0u8; 8];
-                            if rest.len() >= 8 {
-                                amt.copy_from_slice(&rest[..8]);
-                                let amount = u64::from_le_bytes(amt);
-                                if &ix.accounts[1].pubkey == dest_ata && amount == expected_amount {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                    12 => {
-                        // accounts: [source, mint, destination, authority, ...]
-                        if ix.accounts.len() >= 3 {
-                            if rest.len() >= 8 {
-                                let mut amt = [0u8; 8];
-                                amt.copy_from_slice(&rest[..8]);
-                                let amount = u64::from_le_bytes(amt);
-                                if &ix.accounts[2].pubkey == dest_ata && amount == expected_amount {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    for i in 0..=cur {
+        let ix = load_ix_at(i, instr_ai)?;
+        if ix.program_id != TOKEN_PROGRAM_ID {
+            continue;
         }
 
-        i += 1;
+        if let Some((tag, amount, decimals)) = parse_spl_token_amount(&ix.data) {
+            match tag {
+                3 => {
+                    // Transfer: [source, destination, authority, ...]
+                    let dst = ix.accounts.get(1).map(|m| m.pubkey);
+                    let ok = if let Some(dst_pk) = dst {
+                        let amount_ok = expected_amount == 0 || amount == expected_amount;
+                        dst_pk == *expected_dst && amount_ok
+                    } else { false };
+                    trace!("spl@{i}: Transfer amount={amount} dst={:?} ok={}", dst, ok);
+                    if ok { return Ok(()); }
+                }
+                12 => {
+                    // TransferChecked: [source, mint, destination, authority, ...]
+                    let dst = ix.accounts.get(2).map(|m| m.pubkey);
+                    let ok = if let Some(dst_pk) = dst {
+                        let amount_ok = expected_amount == 0 || amount == expected_amount;
+                        dst_pk == *expected_dst && amount_ok
+                    } else { false };
+                    trace!("spl@{i}: TransferChecked amount={amount} dec={:?} dst={:?} ok={}", decimals, dst, ok);
+                    if ok { return Ok(()); }
+                }
+                _ => {
+                    trace!("spl@{i}: token tag {} (ignored)", tag);
+                }
+            }
+        } else {
+            trace!("spl@{i}: unknown token ix (tag={}, len={})",
+                   ix.data.get(0).copied().unwrap_or(0), ix.data.len());
+        }
     }
 
     Err(error!(CipherPayError::RequiredSplTransferMissing))
 }
 
-/// Safely coerce a byte slice into a fixed 32-byte array (copying).
-#[inline]
-pub fn as_fixed_32(bytes: &[u8]) -> Option<[u8; 32]> {
-    if bytes.len() < 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes[..32]);
-    Some(out)
-}
+// ─── Merkle helpers ───
 
-/// Checks if the given Merkle root exists in the root cache (slice variant).
-#[inline]
-pub fn is_valid_root_slice(root: &[u8], cache: &MerkleRootCache) -> bool {
-    match as_fixed_32(root) {
-        Some(fixed) => cache.contains_root(&fixed),
-        None => false,
+pub fn insert_merkle_root(new_root: &[u8; 32], cache: &mut Account<MerkleRootCache>) {
+    if !cache.roots.contains(new_root) {
+        cache.roots.push(*new_root);
     }
 }
 
-/// Checks if the given Merkle root exists in the root cache (fixed-array variant).
-#[inline]
-pub fn is_valid_root(root: &[u8; 32], cache: &MerkleRootCache) -> bool {
-    cache.contains_root(root)
-}
-
-/// Inserts a new Merkle root into the cache (slice variant; evicts oldest if full).
-#[inline]
-pub fn insert_merkle_root_slice(new_root: &[u8], cache: &mut MerkleRootCache) {
-    if let Some(fixed) = as_fixed_32(new_root) {
-        cache.insert_root(fixed);
+pub fn insert_many_roots(new_roots: &[[u8; 32]], cache: &mut Account<MerkleRootCache>) {
+    for r in new_roots {
+        insert_merkle_root(r, cache);
     }
 }
 
-/// Inserts a new Merkle root into the cache (fixed-array variant; evicts oldest if full).
-#[inline]
-pub fn insert_merkle_root(new_root: &[u8; 32], cache: &mut MerkleRootCache) {
-    cache.insert_root(*new_root);
-}
-
-/// Convenience: insert several roots in order (useful for shielded_transfer’s pair of roots).
-#[inline]
-pub fn insert_many_roots<const N: usize>(roots: &[[u8; 32]; N], cache: &mut MerkleRootCache) {
-    for r in roots {
-        cache.insert_root(*r);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fixed32_ok() {
-        let src = [1u8; 40];
-        let got = as_fixed_32(&src).unwrap();
-        assert_eq!(got, [1u8; 32]);
-    }
-
-    #[test]
-    fn fixed32_short() {
-        let src = [0u8; 31];
-        assert!(as_fixed_32(&src).is_none());
-    }
+pub fn is_valid_root(root: &[u8; 32], cache: &Account<MerkleRootCache>) -> bool {
+    cache.roots.contains(root)
 }
