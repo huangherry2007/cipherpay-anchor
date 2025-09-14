@@ -1,104 +1,340 @@
-// src/lib.rs
-#![allow(clippy::too_many_arguments)]
+//! CipherPay Anchor Program (atomic deposit + zk verification)
+
+#![allow(unexpected_cfgs)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(deprecated)]
 
 use anchor_lang::prelude::*;
+#[cfg(feature = "real-crypto")]
+use anchor_spl::token::{self, Transfer as SplTransfer};
 
-// Pull in the verifier module (BPF-safe, struct-based backend).
-pub mod zk_verifier;
-use crate::zk_verifier::solana_verifier; // use fully-qualified calls
-
-// If your program id is fixed in Anchor.toml, keep it the same here.
-declare_id!("9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o");
-
-// Re-export indices in case other modules use them
-pub use crate::zk_verifier::solana_verifier::{deposit_idx, transfer_idx, withdraw_idx};
-
-// Optional: handy constants if other code needs them
-pub use crate::zk_verifier::solana_verifier::{
-    BYTES_F, BYTES_G1, BYTES_G2, BYTES_PROOF, MAX_IC, DEPOSIT_N_PUBLIC, TRANSFER_N_PUBLIC,
-    WITHDRAW_N_PUBLIC,
+use crate::constants::{DEPOSIT_MARKER_SEED, VAULT_SEED};
+use crate::context::*;
+use crate::error::CipherPayError;
+use crate::event::*;
+use crate::utils::{
+    assert_memo_in_same_tx,
+    assert_transfer_checked_in_same_tx,
+    insert_merkle_root,
+    insert_many_roots,
+    is_valid_root,
 };
 
+#[cfg(feature = "real-crypto")]
+use crate::zk_verifier::solana_verifier;
+
+declare_id!("9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o");
+
+pub mod constants;
+pub mod context;
+pub mod error;
+pub mod event;
+pub mod state;
+pub mod utils;
+pub mod zk_verifier;
+
 #[program]
+#[allow(deprecated)]
 pub mod cipherpay_anchor {
     use super::*;
 
-    /// Minimal example: verifies a Groth16 proof for the deposit circuit.
-    /// Replace/extend with your full atomic flow (memo, SPL-Token, etc.).
+    #[cfg(feature = "real-crypto")]
+    use crate::zk_verifier::solana_verifier::{deposit_idx, transfer_idx, withdraw_idx};
+
+    // For builds without `real-crypto`, provide indices so the code compiles.
+    #[cfg(not(feature = "real-crypto"))]
+    mod stub_idx {
+        pub mod deposit_idx {
+            pub const NEW_COMMITMENT: usize = 0;
+            pub const OWNER_CIPHERPAY_PUBKEY: usize = 1;
+            pub const NEW_MERKLE_ROOT: usize = 2;
+            pub const NEW_NEXT_LEAF_INDEX: usize = 3;
+            pub const AMOUNT: usize = 4;
+            pub const DEPOSIT_HASH: usize = 5;
+        }
+        pub mod transfer_idx {
+            pub const OUT_COMMITMENT_1: usize = 0;
+            pub const OUT_COMMITMENT_2: usize = 1;
+            pub const NULLIFIER: usize = 2;
+            pub const MERKLE_ROOT: usize = 3;
+            pub const NEW_MERKLE_ROOT_1: usize = 4;
+            pub const NEW_MERKLE_ROOT_2: usize = 5;
+            pub const NEW_NEXT_LEAF_INDEX: usize = 6;
+            pub const ENC_NOTE1_HASH: usize = 7;
+            pub const ENC_NOTE2_HASH: usize = 8;
+        }
+        pub mod withdraw_idx {
+            pub const NULLIFIER: usize = 0;
+            pub const MERKLE_ROOT: usize = 1;
+            pub const RECIPIENT_WALLET_PUBKEY: usize = 2;
+            pub const AMOUNT: usize = 3;
+            pub const TOKEN_ID: usize = 4;
+        }
+    }
+    #[cfg(not(feature = "real-crypto"))]
+    use stub_idx::{deposit_idx, transfer_idx, withdraw_idx};
+
+    pub fn initialize_vault(_ctx: Context<InitializeVault>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Create an empty Merkle root cache.
+    pub fn initialize_root_cache(ctx: Context<InitializeRootCache>) -> Result<()> {
+        ctx.accounts.root_cache.roots = Vec::new();
+        Ok(())
+    }
+
+    /// Optional SPL hook (no-op in your current design)
+    pub fn deposit_tokens(_ctx: Context<DepositTokens>, _deposit_hash: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Atomic deposit: Memo(deposit_hash) + SPL TransferChecked to vault ATA in the *same* tx,
+    /// then accept zk-proof and roll the Merkle root forward.
     pub fn shielded_deposit_atomic(
-        _ctx: Context<ShieldedDepositAtomic>,
+        ctx: Context<ShieldedDepositAtomic>,
+        deposit_hash: Vec<u8>,
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
-        solana_verifier::verify_deposit(&proof_bytes, &public_inputs_bytes)
-            .map_err(|_| error!(ErrorCode::InvalidZkProof))?;
+        // 0) Basic arg check + normalize
+        require!(deposit_hash.len() == 32, CipherPayError::InvalidInput);
+        let mut deposit_hash32 = [0u8; 32];
+        deposit_hash32.copy_from_slice(&deposit_hash);
+
+        // marker exists (freshly inited here); allow idempotent early return if already processed
+        let marker = &mut ctx.accounts.deposit_marker;
+        if marker.processed {
+            return Ok(());
+        }
+        marker.bump = ctx.bumps.deposit_marker;
+
+        #[cfg(feature = "real-crypto")]
+        {
+            // 1) Verify zk proof
+            solana_verifier::verify_deposit(&proof_bytes, &public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+
+            // 2) Parse public signals
+            let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+            let new_commitment        = sigs[deposit_idx::NEW_COMMITMENT];
+            let owner_cipherpay_pk    = sigs[deposit_idx::OWNER_CIPHERPAY_PUBKEY];
+            let new_root              = sigs[deposit_idx::NEW_MERKLE_ROOT];
+            let new_next_leaf_index   = sigs[deposit_idx::NEW_NEXT_LEAF_INDEX];
+            let amount_fe             = sigs[deposit_idx::AMOUNT];
+            let expected_deposit_hash = sigs[deposit_idx::DEPOSIT_HASH];
+
+            // 3) Proof must bind to the same deposit_hash bytes
+            require!(expected_deposit_hash == deposit_hash32, CipherPayError::InvalidZkProof);
+
+            // 4) field element (LE) -> u64
+            let mut amount_u64: u64 = 0;
+            for i in 0..8 {
+                amount_u64 |= (amount_fe[i] as u64) << (8 * i);
+            }
+
+            // 5) Atomicity: Memo + exact SPL transfer to our vault ATA
+            assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
+            assert_transfer_checked_in_same_tx(
+                &ctx.accounts.instructions,
+                &ctx.accounts.vault_token_account.key(),
+                amount_u64,
+            )?;
+
+            // 6) Commit: update root cache + mark processed
+            insert_merkle_root(&new_root, &mut ctx.accounts.root_cache);
+            marker.processed = true;
+
+            // 7) Emit
+            emit!(DepositCompleted {
+                deposit_hash: deposit_hash32,
+                owner_cipherpay_pubkey: owner_cipherpay_pk,
+                commitment: new_commitment,
+                new_merkle_root: new_root,
+                next_leaf_index: u32::from_le_bytes([
+                    new_next_leaf_index[0], new_next_leaf_index[1],
+                    new_next_leaf_index[2], new_next_leaf_index[3]
+                ]),
+                mint: ctx.accounts.token_mint.key(),
+            });
+        }
+
+        #[cfg(not(feature = "real-crypto"))]
+        {
+            // In non-crypto builds, still enforce atomicity (amount wildcard)
+            assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
+            assert_transfer_checked_in_same_tx(
+                &ctx.accounts.instructions,
+                &ctx.accounts.vault_token_account.key(),
+                0, // wildcard: any positive amount
+            )?;
+
+            marker.processed = true;
+            emit!(DepositCompleted {
+                deposit_hash: deposit_hash32,
+                owner_cipherpay_pubkey: [0u8; 32],
+                commitment: [0u8; 32],
+                new_merkle_root: [0u8; 32],
+                next_leaf_index: 0,
+                mint: ctx.accounts.token_mint.key(),
+            });
+        }
+
         Ok(())
     }
 
-    /// Stub handlers for completeness. Wire up when your transfer/withdraw circuits are ready.
-    pub fn shielded_transfer_atomic(
-        _ctx: Context<ShieldedTransferAtomic>,
+    /// Spend one note, create two, update Merkle roots (no SPL I/O).
+    pub fn shielded_transfer(
+        ctx: Context<ShieldedTransfer>,
+        nullifier: [u8; 32],
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
-        solana_verifier::verify_transfer(&proof_bytes, &public_inputs_bytes)
-            .map_err(|_| error!(ErrorCode::InvalidZkProof))?;
+        #[cfg(feature = "real-crypto")]
+        {
+            solana_verifier::verify_transfer(&proof_bytes, &public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+            let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+
+            let out1_commitment     = sigs[transfer_idx::OUT_COMMITMENT_1];
+            let out2_commitment     = sigs[transfer_idx::OUT_COMMITMENT_2];
+            let nf_from_snark       = sigs[transfer_idx::NULLIFIER];
+            let merkle_root_before  = sigs[transfer_idx::MERKLE_ROOT];
+            let new_root1           = sigs[transfer_idx::NEW_MERKLE_ROOT_1];
+            let new_root2           = sigs[transfer_idx::NEW_MERKLE_ROOT_2];
+            let new_next_leaf_index = sigs[transfer_idx::NEW_NEXT_LEAF_INDEX];
+            let enc1                = sigs[transfer_idx::ENC_NOTE1_HASH];
+            let enc2                = sigs[transfer_idx::ENC_NOTE2_HASH];
+
+            require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
+
+            let rec = &mut ctx.accounts.nullifier_record;
+            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
+            rec.used = true;
+            rec.bump = ctx.bumps.nullifier_record;
+
+            require!(is_valid_root(&merkle_root_before, &ctx.accounts.root_cache), CipherPayError::UnknownMerkleRoot);
+            insert_many_roots(&[new_root1, new_root2], &mut ctx.accounts.root_cache);
+
+            emit!(TransferCompleted {
+                nullifier,
+                out1_commitment,
+                out2_commitment,
+                enc_note1_hash: enc1,
+                enc_note2_hash: enc2,
+                merkle_root_before,
+                new_merkle_root1: new_root1,
+                new_merkle_root2: new_root2,
+                next_leaf_index: u32::from_le_bytes([
+                    new_next_leaf_index[0], new_next_leaf_index[1],
+                    new_next_leaf_index[2], new_next_leaf_index[3]
+                ]),
+                mint: Pubkey::default(), // TODO: thread mint if needed
+            });
+        }
+
+        #[cfg(not(feature = "real-crypto"))]
+        {
+            let rec = &mut ctx.accounts.nullifier_record;
+            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
+            rec.used = true;
+            rec.bump = ctx.bumps.nullifier_record;
+
+            emit!(TransferCompleted {
+                nullifier,
+                out1_commitment: [0u8; 32],
+                out2_commitment: [0u8; 32],
+                enc_note1_hash: [0u8; 32],
+                enc_note2_hash: [0u8; 32],
+                merkle_root_before: [0u8; 32],
+                new_merkle_root1: [0u8; 32],
+                new_merkle_root2: [0u8; 32],
+                next_leaf_index: 0,
+                mint: Pubkey::default(),
+            });
+        }
+
         Ok(())
     }
 
-    pub fn shielded_withdraw_atomic(
-        _ctx: Context<ShieldedWithdrawAtomic>,
+    /// Spend one note, withdraw SPL tokens from the program’s vault ATA to the recipient.
+    pub fn shielded_withdraw(
+        ctx: Context<ShieldedWithdraw>,
+        nullifier: [u8; 32],
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
-        solana_verifier::verify_withdraw(&proof_bytes, &public_inputs_bytes)
-            .map_err(|_| error!(ErrorCode::InvalidZkProof))?;
+        #[cfg(feature = "real-crypto")]
+        {
+            solana_verifier::verify_withdraw(&proof_bytes, &public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+            let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
+                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+
+            let nf_from_snark = sigs[withdraw_idx::NULLIFIER];
+            let merkle_root   = sigs[withdraw_idx::MERKLE_ROOT];
+            let recipient_pk  = sigs[withdraw_idx::RECIPIENT_WALLET_PUBKEY];
+            let amount_fe     = sigs[withdraw_idx::AMOUNT];
+            let _token_id     = sigs[withdraw_idx::TOKEN_ID];
+
+            require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
+
+            let rec = &mut ctx.accounts.nullifier_record;
+            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
+            rec.used = true;
+            rec.bump = ctx.bumps.nullifier_record;
+
+            require!(is_valid_root(&merkle_root, &ctx.accounts.root_cache), CipherPayError::UnknownMerkleRoot);
+
+            // FE (LE) -> u64
+            let mut amount: u64 = 0;
+            for i in 0..8 { amount |= (amount_fe[i] as u64) << (8 * i); }
+
+            // Transfer SPL from program vault ATA to recipient ATA.
+            let cpi_accounts = SplTransfer {
+                from: ctx.accounts.vault_token_account.to_account_info(),
+                to: ctx.accounts.recipient_token_account.to_account_info(),
+                authority: ctx.accounts.vault_pda.to_account_info(),
+            };
+
+            let bump = ctx.bumps.vault_pda;
+            let seeds: &[&[u8]] = &[VAULT_SEED, &[bump]];
+            let signer: &[&[&[u8]]] = &[seeds];
+
+            let cpi_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+                signer,
+            );
+            token::transfer(cpi_ctx, amount).map_err(|_| error!(CipherPayError::TokenTransferFailed))?;
+
+            emit!(WithdrawCompleted {
+                nullifier,
+                recipient: ctx.accounts.recipient_owner.key(),
+                amount,
+                mint: ctx.accounts.token_mint.key(),
+            });
+        }
+
+        #[cfg(not(feature = "real-crypto"))]
+        {
+            let rec = &mut ctx.accounts.nullifier_record;
+            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
+            rec.used = true;
+            rec.bump = ctx.bumps.nullifier_record;
+
+            emit!(WithdrawCompleted {
+                nullifier,
+                recipient: ctx.accounts.recipient_owner.key(),
+                amount: 0,
+                mint: ctx.accounts.token_mint.key(),
+            });
+        }
+
         Ok(())
     }
 }
-
-// ----------------------------- Accounts -------------------------------------
-
-#[derive(Accounts)]
-pub struct ShieldedDepositAtomic<'info> {
-    // Keep your real accounts here (vault, mint, payer, system_program, token_program, etc.)
-    // This placeholder struct compiles; extend to your full account set.
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct ShieldedTransferAtomic<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct ShieldedWithdrawAtomic<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-// ------------------------------ Errors --------------------------------------
-
-#[error_code]
-pub enum ErrorCode {
-    #[msg("Zero-knowledge proof verification failed.")]
-    InvalidZkProof,
-}
-
-// ------------------------------ Tests helpers (optional) --------------------
-// If other modules were importing functions directly from `crate::zk_verifier::{ ... }`,
-// keep calls fully-qualified like: `solana_verifier::verify_deposit(&proof, &publics)?;`
-//
-// If you truly need the old flat imports, you could also re-export here:
-//
-// pub use crate::zk_verifier::solana_verifier::{
-//     verify_deposit, verify_transfer, verify_withdraw, parse_public_signals_exact,
-// };
-//
-// …but the recommended approach is to import the module then call:
-//     solana_verifier::verify_deposit(...)

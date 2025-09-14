@@ -32,6 +32,7 @@ real-crypto = []
 memo = ["spl-memo"]
 
 [dependencies]
+hex = "0.4"
 anchor-lang = "0.31.1"
 anchor-spl  = { version = "0.31.1", default-features = false, features = ["token", "token_2022", "associated_token"] }
 
@@ -65,3 +66,4 @@ env_logger = "0.10"
 rand = "0.8"
 
 [patch.crates-io]
+
