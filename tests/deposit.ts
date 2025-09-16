@@ -22,6 +22,11 @@ function readBin(p: string): Buffer {
 function toHexLE(b: Buffer): string {
   return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
+function toHexBE(b: Buffer): string {
+  const r = Buffer.from(b);
+  r.reverse();
+  return toHexLE(r);
+}
 function slice32(buf: Buffer, i: number): Buffer {
   const off = i * 32;
   return buf.subarray(off, off + 32);
@@ -76,6 +81,24 @@ async function computeZeroRoot(depth: number): Promise<Uint8Array> {
   let node = BigInt(0); // zero leaf
   for (let i = 0; i < depth; i++) node = H2(node, node);
   return toLeBytes32FromBig(node);
+}
+
+// FE decoders for 32-byte arrays (avoid BigInt literals for ES<2020)
+function fromLeBytes32(u8: Uint8Array): bigint {
+  let x = BigInt(0);
+  const EIGHT = BigInt(8);
+  for (let i = 31; i >= 0; i--) {
+    x = (x << EIGHT) + BigInt(u8[i]);
+  }
+  return x;
+}
+function fromBeBytes32(u8: Uint8Array): bigint {
+  let x = BigInt(0);
+  const EIGHT = BigInt(8);
+  for (let i = 0; i < 32; i++) {
+    x = (x << EIGHT) + BigInt(u8[i]);
+  }
+  return x;
 }
 
 // ───────────────────────── config ─────────────────────────
@@ -382,6 +405,44 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       const s = k.isSigner ? " (signer)" : "";
       console.log(`  [${i}] ${k.pubkey.toBase58()}${s}${w}`);
     });
+
+    // ── On-chain root vs. proof oldMerkleRoot sanity check ─────────────
+    {
+      // oldMerkleRoot (field element) as the circuit produced it (LE in your bin)
+      const oldRootBytesLE = slice32(publicInputsBytes, DEPOSIT_IDX.OLD_ROOT);
+      const oldRootFE = fromLeBytes32(new Uint8Array(oldRootBytesLE));
+
+      // fetch on-chain bytes from TreeState (your IDL shows 'currentRoot')
+      const acc = await program.account.treeState.fetch(treePda);
+      const rootBytesArr = new Uint8Array(acc.currentRoot as number[]);
+      const rootBuf = Buffer.from(rootBytesArr);
+
+      const feLE = fromLeBytes32(rootBytesArr);
+      const feBE = fromBeBytes32(rootBytesArr);
+
+      console.log("🌲 on-chain root (LE hex):", toHexLE(rootBuf));
+      console.log("🌲 on-chain root (BE hex):", toHexBE(rootBuf));
+      console.log("   on-chain FE (LE decode):", feLE.toString());
+      console.log("   on-chain FE (BE decode):", feBE.toString());
+      console.log("   proof oldMerkleRoot FE :", oldRootFE.toString());
+
+      const matchesBE = feBE === oldRootFE;
+      const matchesLE = feLE === oldRootFE;
+
+      if (!matchesBE && !matchesLE) {
+        throw new Error(
+          "On-chain root bytes do not decode to the proof's oldMerkleRoot (neither BE nor LE)."
+        );
+      }
+      if (matchesBE && !matchesLE) {
+        console.log("✅ oldMerkleRoot matches on-chain (BE decode).");
+      } else if (!matchesBE && matchesLE) {
+        console.log("✅ oldMerkleRoot matches on-chain (LE decode).");
+      } else {
+        console.log("✅ oldMerkleRoot matches on-chain (both BE & LE decode).");
+      }
+    }
+    // ───────────────────────────────────────────────────────────────────
 
     try {
       const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: false });
