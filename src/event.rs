@@ -9,11 +9,9 @@ pub struct DepositCompleted {
     pub deposit_hash: [u8; 32],
     pub owner_cipherpay_pubkey: [u8; 32],
     pub commitment: [u8; 32],
-    /// Root after insertion
+    pub old_merkle_root: [u8; 32],  // NEW
     pub new_merkle_root: [u8; 32],
-    /// Leaf index used for this insertion
     pub next_leaf_index: u32,
-    /// SPL mint that identifies the vault this went into
     pub mint: Pubkey,
 }
 

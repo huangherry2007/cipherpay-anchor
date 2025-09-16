@@ -42,6 +42,19 @@ impl Nullifier {
     }
 }
 
+#[account]
+pub struct TreeState {
+    pub version:     u16,        // v1
+    pub current_root:[u8; 32],
+    pub next_index:  u32,
+    pub depth:       u8,
+    pub _reserved:   [u8; 31],   // future flags/fields (optional)
+}
+// Anchor 0.29+: implement `Space` with `INIT_SPACE`
+impl anchor_lang::Space for TreeState {
+    const INIT_SPACE: usize = 2 + 32 + 4 + 1 + 31;
+}
+
 /// Ring-buffer-ish cache of recent Merkle roots (simple Vec variant).
 ///
 /// Layout: Anchor serializes `Vec<[u8;32]>` as `4 (len) + len * 32` bytes.

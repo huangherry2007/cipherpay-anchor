@@ -275,3 +275,18 @@ RUST_BACKTRACE=1 cargo test
 # Run tests in single thread
 cargo test -- --test-threads=1
 ```
+
+### test procedures on localnet
+step 1: start "solana-test-validator --reset"
+step 2: anchor build -- --features real-crypto
+step 3: anchor deploy
+step 4:
+export CP_TREE_DEPTH=16
+export CP_HASH_VARIANT=poseidon
+export CP_GENESIS_ROOT=0x2a7c7c9b6ce5880b9f6f228d72bf6a575a526f29c66ecceef8b753d38bba7323
+
+ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 \
+ANCHOR_WALLET=~/.config/solana/id.json \
+anchor run init
+step 5:
+npm run test:deposit

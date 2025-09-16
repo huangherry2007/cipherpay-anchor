@@ -5,8 +5,26 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
 
-use crate::constants::{DEPOSIT_MARKER_SEED, NULLIFIER_SEED, VAULT_SEED};
+use crate::constants::{DEPOSIT_MARKER_SEED, NULLIFIER_SEED, VAULT_SEED, TREE_SEED};
 use crate::state::*;
+
+/// Initialize the global Merkle tree state (one per deployment/cluster)
+#[derive(Accounts)]
+pub struct InitializeTreeState<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + TreeState::INIT_SPACE,   // ← was SIZE
+        seeds = [TREE_SEED],
+        bump
+    )]
+    pub tree: Account<'info, TreeState>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
 
 // ---------------- Init vault PDA (authority-held mint authority elsewhere) ---------------
 #[derive(Accounts)]
@@ -57,17 +75,20 @@ pub struct DepositTokens<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-/// Atomic deposit accounts (production)
+
 #[derive(Accounts)]
 #[instruction(deposit_hash: Vec<u8>, proof_bytes: Vec<u8>, public_inputs_bytes: Vec<u8>)]
 pub struct ShieldedDepositAtomic<'info> {
     #[account(mut, signer)]
     pub payer: Signer<'info>,
 
+    // NEW: single-history cursor
+    #[account(mut, seeds = [TREE_SEED], bump)]
+    pub tree: Account<'info, TreeState>,
+
     #[account(mut)]
     pub root_cache: Account<'info, MerkleRootCache>,
 
-    // The deposit marker PDA is created once per `deposit_hash`.
     #[account(
         init,
         payer = payer,
@@ -91,8 +112,8 @@ pub struct ShieldedDepositAtomic<'info> {
     pub instructions: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program: Program<'info, anchor_spl::token::Token>,
+    pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
 }
 
 /// Nullifier record for shielded transfer
