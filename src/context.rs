@@ -14,7 +14,7 @@ pub struct InitializeTreeState<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + TreeState::INIT_SPACE,   // ← was SIZE
+        space = 8 + TreeState::INIT_SPACE,   // keep whichever constant your state defines
         seeds = [TREE_SEED],
         bump
     )]
@@ -75,14 +75,13 @@ pub struct DepositTokens<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-
 #[derive(Accounts)]
 #[instruction(deposit_hash: Vec<u8>, proof_bytes: Vec<u8>, public_inputs_bytes: Vec<u8>)]
 pub struct ShieldedDepositAtomic<'info> {
     #[account(mut, signer)]
     pub payer: Signer<'info>,
 
-    // NEW: single-history cursor
+    // global tree
     #[account(mut, seeds = [TREE_SEED], bump)]
     pub tree: Account<'info, TreeState>,
 
@@ -116,24 +115,30 @@ pub struct ShieldedDepositAtomic<'info> {
     pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
 }
 
-/// Nullifier record for shielded transfer
 #[derive(Accounts)]
 #[instruction(nullifier: [u8; 32])]
 pub struct ShieldedTransfer<'info> {
-    #[account(
-        init,
-        seeds = [NULLIFIER_SEED, &nullifier],
-        bump,
-        payer = authority,
-        space = 8 + Nullifier::SIZE
-    )]
-    pub nullifier_record: Account<'info, Nullifier>,
+    /// The global tree state (strict sync mode: must match proof's spent root)
+    #[account(mut, seeds = [TREE_SEED], bump)]
+    pub tree: Account<'info, TreeState>,
 
+    /// Rolling root cache (useful for withdraws/telemetry)
     #[account(mut)]
     pub root_cache: Account<'info, MerkleRootCache>,
 
+    /// Nullifier record: one-time use
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + Nullifier::SIZE,
+        seeds = [NULLIFIER_SEED, &nullifier],
+        bump
+    )]
+    pub nullifier_record: Account<'info, Nullifier>,
+
+    /// Payer for rent when creating the nullifier record
     #[account(mut)]
-    pub authority: Signer<'info>,
+    pub payer: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
