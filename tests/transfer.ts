@@ -1,119 +1,186 @@
+// tests/transfer.ts
+import * as fs from "fs";
+import * as path from "path";
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, Keypair } from "@solana/web3.js";
-import { assert } from "chai";
-import fs from "fs";
-import path from "path";
-
+import { Program, AnchorProvider, web3 } from "@coral-xyz/anchor";
 import { CipherpayAnchor } from "../target/types/cipherpay_anchor";
 
-/**
- * TypeScript Integration Tests for Shielded Transfer
- * 
- * Purpose: Real program integration testing with actual ZK proofs
- * Focus: Client-side transfer workflows, real cryptographic validation
- * 
- * These tests complement the Rust unit tests by testing:
- * - Real program deployment and execution
- * - Actual ZK proof verification for transfers
- * - Client-side integration patterns
- * - Production-like transfer scenarios
- */
-
-// === Utility: Load proof, inputs, and nullifier ===
-function loadTransferProofAndInputs() {
-  const proof = fs.readFileSync(path.resolve(__dirname, `../proofs/transfer_proof.bin`));
-  const publicInputs = fs.readFileSync(path.resolve(__dirname, `../proofs/transfer_public_inputs.bin`));
-  
-  // Validate the new circuit structure: 6 signals for transfer circuit
-  if (publicInputs.length !== 192) { // 6 signals × 32 bytes
-    throw new Error(`Expected 192 bytes for transfer public inputs, got ${publicInputs.length}`);
-  }
-  
-  // Extract nullifier from public inputs (signal 0 - index 0-31)
-  // The new transfer circuit structure has 6 signals:
-  // Signal 0: Nullifier (0-31)
-  // Signal 1: Merkle root (32-63)
-  // Signal 2: Out1 commitment (64-95)
-  // Signal 3: Out2 commitment (96-127)
-  // Signal 4: Out1 pubkey (128-159)
-  // Signal 5: Out2 pubkey (160-191)
-  const nullifier = Buffer.from(publicInputs.subarray(0, 32));
-  
-  return { proof, publicInputs, nullifier };
+// ───────────────────────── helpers ─────────────────────────
+function readBin(p: string): Buffer {
+  return fs.readFileSync(path.resolve(p));
+}
+function toHexLE(b: Buffer): string {
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+function slice32(buf: Buffer, i: number): Buffer {
+  const off = i * 32;
+  return buf.subarray(off, off + 32);
+}
+async function ensureAirdrop(
+  connection: web3.Connection,
+  pubkey: web3.PublicKey,
+  wantLamports = 10 * web3.LAMPORTS_PER_SOL
+) {
+  const before = await connection.getBalance(pubkey);
+  if (before >= wantLamports) return before;
+  const sig = await connection.requestAirdrop(pubkey, wantLamports - before);
+  await connection.confirmTransaction(sig, "confirmed");
+  return await connection.getBalance(pubkey);
 }
 
-// === Real Program Integration Tests ===
-describe("Shielded Transfer - Real Program Integration", () => {
-  const provider = anchor.AnchorProvider.env();
+// ───────────────────────── config ─────────────────────────
+const RPC_URL = process.env.SOLANA_URL || "http://127.0.0.1:8899";
+const DEFAULT_DEPTH = Number(process.env.CP_TREE_DEPTH ?? 16);
+const TREE_SEED = Buffer.from("tree");
+const NULLIFIER_SEED = Buffer.from("nullifier");
+
+// proofs dir (override with env if desired)
+const buildDir = process.env.TRANSFER_BUILD_DIR
+  ? path.resolve(process.env.TRANSFER_BUILD_DIR)
+  : path.resolve("proofs");
+const proofPath = path.join(buildDir, "transfer_proof.bin");
+const publicsPath = path.join(buildDir, "transfer_public_signals.bin");
+
+// public signal order (transfer.circom):
+// [ outCommitment1, outCommitment2, nullifier, merkleRoot,
+//   newMerkleRoot1, newMerkleRoot2, newNextLeafIndex, encNote1Hash, encNote2Hash ]
+const TRANSFER_IDX = {
+  OUT1: 0,
+  OUT2: 1,
+  NULLIFIER: 2,
+  MERKLE_ROOT: 3,
+  NEW_ROOT1: 4,
+  NEW_ROOT2: 5,
+  NEW_NEXT_IDX: 6,
+  ENC1: 7,
+  ENC2: 8,
+};
+
+// ───────────────────────── tests ─────────────────────────
+describe("shielded_transfer — strict sync", () => {
+  const connection = new web3.Connection(RPC_URL, "confirmed");
+  const wallet = new anchor.Wallet(
+    web3.Keypair.fromSecretKey(
+      Buffer.from(
+        JSON.parse(
+          fs.readFileSync(process.env.HOME + "/.config/solana/id.json", "utf8")
+        )
+      )
+    )
+  );
+  const provider = new AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+  });
   anchor.setProvider(provider);
 
   const program = anchor.workspace.CipherpayAnchor as Program<CipherpayAnchor>;
+  const programId = program.programId;
+  const payer = wallet.publicKey;
 
-  // Test accounts
-  const rootCache = Keypair.generate();
-  const nullifierRecord = Keypair.generate();
+  console.log("🧭 programId:", programId.toBase58());
 
-  it("Executes real shielded transfer with ZK proof verification", async () => {
-    const { proof, publicInputs, nullifier } = loadTransferProofAndInputs();
+  // will be populated in tests
+  let proofBytes: Buffer;
+  let publicInputsBytes: Buffer;
+  let nullifierBuf!: Buffer;      // 32B (LE)
+  let merkleRootBefore!: Buffer;  // 32B (LE)
 
-    console.log("🔍 REAL TRANSFER ZK PROOF VERIFICATION");
-    console.log("📊 Proof size:", proof.length, "bytes");
-    console.log("📋 Public inputs size:", publicInputs.length, "bytes");
-    console.log("🔐 Nullifier:", nullifier.toString('hex'));
+  // PDAs & accounts
+  let treePda!: web3.PublicKey;
+  const rootCache = web3.Keypair.generate(); // signer for init
 
-    const [vaultPda] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("vault")],
-      program.programId
-    );
+  beforeAll(async () => {
+    await ensureAirdrop(connection, payer);
 
-    const [nullifierRecordPda] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("nullifier"), nullifier],
-      program.programId
-    );
+    // load proof + publics (MUST be Buffers for Anchor `bytes`)
+    proofBytes = readBin(proofPath);
+    publicInputsBytes = readBin(publicsPath);
+    expect(proofBytes.length).toBe(256);
+    expect(publicInputsBytes.length).toBe(9 * 32);
 
-    // Core test - real ZK proof verification for transfer
-    const tx = await program.methods
-      .shieldedTransfer([...nullifier], [...proof], [...publicInputs])
-      .accounts({
-        authority: provider.wallet.publicKey,
-        rootCache: rootCache.publicKey,
-        nullifierRecord: nullifierRecordPda,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([]) // PDA accounts don't need to sign
-      .rpc();
+    // extract fields we need
+    nullifierBuf = slice32(publicInputsBytes, TRANSFER_IDX.NULLIFIER);
+    merkleRootBefore = slice32(publicInputsBytes, TRANSFER_IDX.MERKLE_ROOT);
 
-    console.log("✅ REAL transfer ZK proof verification successful:", tx);
+    console.log("🔒 nullifier (LE, hex):", toHexLE(nullifierBuf));
+    console.log("🌲 spent merkle root (LE, hex):", toHexLE(merkleRootBefore));
+
+    // ---- Initialize global TreeState to the *spent* root (strict sync) ----
+    [treePda] = web3.PublicKey.findProgramAddressSync([TREE_SEED], programId);
+
+    const preInfo = await connection.getAccountInfo(treePda);
+    if (!preInfo) {
+      // Initialize with depth and the spent root from the proof
+      await program.methods
+        .initializeTreeState(DEFAULT_DEPTH, Array.from(merkleRootBefore))
+        .accountsPartial({
+          tree: treePda,
+          authority: payer,
+          systemProgram: web3.SystemProgram.programId,
+        })
+        .rpc();
+      console.log("✅ initialize_tree_state ok (bootstrapped to spent root)");
+    } else {
+      console.log("ℹ️ tree already exists — make sure it matches your spent root.");
+    }
+
+    // ---- Initialize Root Cache (idempotent) ----
+    try {
+      await program.methods
+        .initializeRootCache()
+        .accounts({
+          rootCache: rootCache.publicKey,
+          authority: payer,
+          // ⬅️ DO NOT pass systemProgram here (Anchor treats it as constant)
+        })
+        .signers([rootCache])
+        .rpc();
+      console.log("✅ initialize_root_cache ok");
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (!/already in use/i.test(msg)) throw e;
+      console.log("ℹ️ root_cache already exists");
+    }
   });
 
-  it("Validates real transfer circuit structure and data", async () => {
-    const { proof, publicInputs } = loadTransferProofAndInputs();
-    
-    console.log("🔍 REAL TRANSFER CIRCUIT VALIDATION");
-    console.log("📏 Proof size:", proof.length, "bytes (expected: 512)");
-    console.log("📏 Public inputs size:", publicInputs.length, "bytes (expected: 192)");
-    
-    // Validate proof structure for groth16-solana compatibility
-    assert.equal(proof.length, 512, "Proof should be 512 bytes for Groth16");
-    assert.equal(publicInputs.length, 192, "Public inputs should be 192 bytes (6 signals × 32 bytes)");
-    
-    // Extract and display real circuit signals
-    const nullifier = publicInputs.subarray(0, 32);
-    const merkleRoot = publicInputs.subarray(32, 64);
-    const out1Commitment = publicInputs.subarray(64, 96);
-    const out2Commitment = publicInputs.subarray(96, 128);
-    const out1Pubkey = publicInputs.subarray(128, 160);
-    const out2Pubkey = publicInputs.subarray(160, 192);
-    
-    console.log("📋 Real transfer circuit signals:");
-    console.log("   Signal 0 (Nullifier):", nullifier.toString('hex'));
-    console.log("   Signal 1 (Merkle Root):", merkleRoot.toString('hex'));
-    console.log("   Signal 2 (Out1 Commitment):", out1Commitment.toString('hex'));
-    console.log("   Signal 3 (Out2 Commitment):", out2Commitment.toString('hex'));
-    console.log("   Signal 4 (Out1 Pubkey):", out1Pubkey.toString('hex'));
-    console.log("   Signal 5 (Out2 Pubkey):", out2Pubkey.toString('hex'));
-    
-    console.log("✅ Real transfer circuit validation passed");
+  it("verifies on-chain via shielded_transfer (strict sync)", async () => {
+    // Derive nullifier record PDA from the 32-byte nullifier (same seeds as program)
+    const [nullifierRecordPda] = web3.PublicKey.findProgramAddressSync(
+      [NULLIFIER_SEED, nullifierBuf],
+      programId
+    );
+
+    // Build & send (IMPORTANT: `proofBytes` and `publicInputsBytes` are Buffers)
+    const sig = await program.methods
+      .shieldedTransfer(Array.from(nullifierBuf), proofBytes, publicInputsBytes)
+      .accountsPartial({
+        tree: treePda,
+        rootCache: rootCache.publicKey,
+        nullifierRecord: nullifierRecordPda,
+        payer,
+        // systemProgram omitted: Anchor knows the constant id
+      })
+      .rpc();
+
+    console.log("✅ shielded_transfer tx:", sig);
+
+    // show on-chain logs even on success
+    const res = await connection.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    console.log("---- on-chain logs ----");
+    res?.meta?.logMessages?.forEach((l) => console.log(l));
+    console.log("---- end logs ----");
+  });
+
+  it("sanity: proof/public bytes lengths", () => {
+    const a = proofBytes.subarray(0, 64);
+    const b = proofBytes.subarray(64, 192);
+    const c = proofBytes.subarray(192, 256);
+    expect(a.length).toBe(64);
+    expect(b.length).toBe(128);
+    expect(c.length).toBe(64);
+    expect(publicInputsBytes.length).toBe(9 * 32);
   });
 });
