@@ -10,7 +10,7 @@ use anchor_lang::prelude::*;
 #[cfg(feature = "real-crypto")]
 use anchor_spl::token::{self, Transfer as SplTransfer};
 
-use crate::constants::{DEPOSIT_MARKER_SEED, VAULT_SEED};
+use crate::constants::{DEPOSIT_MARKER_SEED, VAULT_SEED, TREE_SEED};
 use crate::context::*;
 use crate::error::CipherPayError;
 use crate::event::*;
@@ -53,6 +53,7 @@ pub mod cipherpay_anchor {
             pub const NEW_NEXT_LEAF_INDEX: usize = 3;
             pub const AMOUNT: usize = 4;
             pub const DEPOSIT_HASH: usize = 5;
+            pub const OLD_MERKLE_ROOT: usize = 6;
         }
         pub mod transfer_idx {
             pub const OUT_COMMITMENT_1: usize = 0;
@@ -86,6 +87,15 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
+    pub fn initialize_tree_state(ctx: Context<InitializeTreeState>, depth: u8, genesis_root: [u8;32]) -> Result<()> {
+        let t = &mut ctx.accounts.tree;
+        t.version      = 1;
+        t.depth        = depth;
+        t.current_root = genesis_root;
+        t.next_index   = 0;
+        Ok(())
+    }
+
     /// Optional SPL hook (no-op in your current design)
     pub fn deposit_tokens(_ctx: Context<DepositTokens>, _deposit_hash: Vec<u8>) -> Result<()> {
         Ok(())
@@ -99,12 +109,10 @@ pub mod cipherpay_anchor {
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
-        // 0) Basic arg check + normalize
         require!(deposit_hash.len() == 32, CipherPayError::InvalidInput);
         let mut deposit_hash32 = [0u8; 32];
         deposit_hash32.copy_from_slice(&deposit_hash);
 
-        // marker exists (freshly inited here); allow idempotent early return if already processed
         let marker = &mut ctx.accounts.deposit_marker;
         if marker.processed {
             return Ok(());
@@ -113,30 +121,27 @@ pub mod cipherpay_anchor {
 
         #[cfg(feature = "real-crypto")]
         {
-            // 1) Verify zk proof
             solana_verifier::verify_deposit(&proof_bytes, &public_inputs_bytes)
                 .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
 
-            // 2) Parse public signals
             let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
                 .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+
             let new_commitment        = sigs[deposit_idx::NEW_COMMITMENT];
             let owner_cipherpay_pk    = sigs[deposit_idx::OWNER_CIPHERPAY_PUBKEY];
             let new_root              = sigs[deposit_idx::NEW_MERKLE_ROOT];
             let new_next_leaf_index   = sigs[deposit_idx::NEW_NEXT_LEAF_INDEX];
             let amount_fe             = sigs[deposit_idx::AMOUNT];
             let expected_deposit_hash = sigs[deposit_idx::DEPOSIT_HASH];
+            let old_root              = sigs[deposit_idx::OLD_MERKLE_ROOT]; // <— NEW
 
-            // 3) Proof must bind to the same deposit_hash bytes
             require!(expected_deposit_hash == deposit_hash32, CipherPayError::InvalidZkProof);
 
-            // 4) field element (LE) -> u64
+            // FE (LE) -> u64
             let mut amount_u64: u64 = 0;
-            for i in 0..8 {
-                amount_u64 |= (amount_fe[i] as u64) << (8 * i);
-            }
+            for i in 0..8 { amount_u64 |= (amount_fe[i] as u64) << (8*i); }
 
-            // 5) Atomicity: Memo + exact SPL transfer to our vault ATA
+            // Atomicity with the SPL tx in the same transaction
             assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
             assert_transfer_checked_in_same_tx(
                 &ctx.accounts.instructions,
@@ -144,41 +149,49 @@ pub mod cipherpay_anchor {
                 amount_u64,
             )?;
 
-            // 6) Commit: update root cache + mark processed
-            insert_merkle_root(&new_root, &mut ctx.accounts.root_cache);
-            marker.processed = true;
+            // Single-history checks
+            require!(old_root == ctx.accounts.tree.current_root, CipherPayError::OldRootMismatch);
+            let sig_next = u32::from_le_bytes([new_next_leaf_index[0], new_next_leaf_index[1], new_next_leaf_index[2], new_next_leaf_index[3]]);
+            require!(sig_next == ctx.accounts.tree.next_index + 1, CipherPayError::InvalidInput);
 
-            // 7) Emit
+            // State updates
+            ctx.accounts.tree.current_root = new_root;
+            ctx.accounts.tree.next_index   = sig_next;
+
+            insert_merkle_root(&new_root, &mut ctx.accounts.root_cache);
+
+            marker.processed = true;
             emit!(DepositCompleted {
                 deposit_hash: deposit_hash32,
                 owner_cipherpay_pubkey: owner_cipherpay_pk,
                 commitment: new_commitment,
+                old_merkle_root: old_root,        // <— include in event
                 new_merkle_root: new_root,
-                next_leaf_index: u32::from_le_bytes([
-                    new_next_leaf_index[0], new_next_leaf_index[1],
-                    new_next_leaf_index[2], new_next_leaf_index[3]
-                ]),
+                next_leaf_index: sig_next,
                 mint: ctx.accounts.token_mint.key(),
             });
         }
 
         #[cfg(not(feature = "real-crypto"))]
         {
-            // In non-crypto builds, still enforce atomicity (amount wildcard)
             assert_memo_in_same_tx(&ctx.accounts.instructions, &deposit_hash32)?;
             assert_transfer_checked_in_same_tx(
                 &ctx.accounts.instructions,
                 &ctx.accounts.vault_token_account.key(),
-                0, // wildcard: any positive amount
+                0,
             )?;
+
+            // For stub builds, still bump the cursor deterministically.
+            ctx.accounts.tree.next_index = ctx.accounts.tree.next_index.saturating_add(1);
 
             marker.processed = true;
             emit!(DepositCompleted {
                 deposit_hash: deposit_hash32,
                 owner_cipherpay_pubkey: [0u8; 32],
                 commitment: [0u8; 32],
+                old_merkle_root: [0u8; 32],
                 new_merkle_root: [0u8; 32],
-                next_leaf_index: 0,
+                next_leaf_index: ctx.accounts.tree.next_index,
                 mint: ctx.accounts.token_mint.key(),
             });
         }

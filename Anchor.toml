@@ -18,8 +18,10 @@ url = "https://api.apr.dev"
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
-# [scripts]
+[scripts]
 # test = "anchor test"
+# anchor run init
+init = "ts-node migrations/01_init.ts"
 
 [workspace]
 members = [

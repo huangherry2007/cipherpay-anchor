@@ -18,14 +18,14 @@
     "@solana/spl-token": "^0.3.9",
     "@solana/web3.js": "^1.87.0",
     "chai": "^4.3.0",
-    "circomlibjs": "^0.1.7",
     "snarkit2": "^0.2.0"
   },
   "devDependencies": {
     "@types/chai": "^4.3.0",
     "@types/jest": "^30.0.0",
     "@types/mocha": "^10.0.0",
-    "@types/node": "^20.0.0",
+    "@types/node": "^20.19.14",
+    "circomlibjs": "^0.1.7",
     "jest": "^30.0.5",
     "snarkjs": "0.7.4",
     "ts-jest": "^29.4.1",
@@ -33,6 +33,6 @@
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
     "tsx": "^4.20.3",
-    "typescript": "^5.0.0"
+    "typescript": "^5.9.2"
   }
 }

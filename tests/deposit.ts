@@ -56,9 +56,33 @@ async function ensureAtaIx(
   );
 }
 
+// Poseidon zero-root helpers (BigInt-safe: no literals)
+function toLeBytes32FromBig(n: bigint): Uint8Array {
+  const out = new Uint8Array(32);
+  const EIGHT = BigInt(8);
+  const FF = BigInt(0xff);
+  for (let i = 0; i < 32; i++) {
+    const shift = BigInt(i) * EIGHT;
+    out[i] = Number((n >> shift) & FF);
+  }
+  return out;
+}
+async function computeZeroRoot(depth: number): Promise<Uint8Array> {
+  // @ts-ignore: circomlibjs has no types
+  const { buildPoseidon } = await import("circomlibjs");
+  const poseidon = await buildPoseidon();
+  const F = (poseidon as any).F;
+  const H2 = (a: bigint, b: bigint) => F.toObject(poseidon([a, b])) as bigint;
+  let node = BigInt(0); // zero leaf
+  for (let i = 0; i < depth; i++) node = H2(node, node);
+  return toLeBytes32FromBig(node);
+}
+
 // ───────────────────────── config ─────────────────────────
 const RPC_URL = process.env.SOLANA_URL || "http://127.0.0.1:8899";
 const CU_LIMIT = Number(process.env.CU_LIMIT ?? 800_000);
+const DEFAULT_DEPTH = Number(process.env.CP_TREE_DEPTH ?? 16);
+const TREE_SEED = Buffer.from("tree");
 
 // proofs dir (override with env if desired)
 const buildDir = process.env.DEPOSIT_BUILD_DIR
@@ -67,8 +91,18 @@ const buildDir = process.env.DEPOSIT_BUILD_DIR
 const proofPath = path.join(buildDir, "deposit_proof.bin");
 const publicsPath = path.join(buildDir, "deposit_public_signals.bin");
 
-// circuit ordering: [newCommitment, owner, newRoot, nextIdx, amount, depositHash]
-const DEPOSIT_IDX = { AMOUNT: 4, DEPOSIT_HASH: 5 };
+// public signal order used by your circuit export:
+// newCommitment, ownerCipherPayPubKey, newMerkleRoot, newNextLeafIndex,
+// amount, depositHash, oldMerkleRoot
+const DEPOSIT_IDX = {
+  NEW_COMMITMENT: 0,
+  OWNER: 1,
+  NEW_ROOT: 2,
+  NEW_NEXT_IDX: 3,
+  AMOUNT: 4,
+  DEPOSIT_HASH: 5,
+  OLD_ROOT: 6,
+};
 
 // PDA seeds (must match on-chain constants)
 const VAULT_SEED = Buffer.from("vault");
@@ -121,7 +155,8 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
   let vaultPda!: web3.PublicKey;
   let vaultAta!: web3.PublicKey;
 
-  // accounts
+  // global tree & root cache
+  let treePda!: web3.PublicKey;
   const rootCache = web3.Keypair.generate(); // signer init account
 
   beforeAll(async () => {
@@ -131,14 +166,11 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
     proofBytes = readBin(proofPath);
     publicInputsBytes = readBin(publicsPath);
     expect(proofBytes.length).toBe(256);
-    expect(publicInputsBytes.length).toBe(6 * 32);
+    expect(publicInputsBytes.length).toBe(7 * 32);
 
     // extract fields
     depositHash = slice32(publicInputsBytes, DEPOSIT_IDX.DEPOSIT_HASH);
-    console.log(
-      "🔑 depositHash (LE, hex):",
-      toHexLE(depositHash)
-    );
+    console.log("🔑 depositHash (LE, hex):", toHexLE(depositHash));
 
     const amountFe = slice32(publicInputsBytes, DEPOSIT_IDX.AMOUNT);
     // little-endian u64 in first 8 bytes → JS number (assumes it fits)
@@ -153,7 +185,47 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       (amountFe[7] * 2 ** 56);
     console.log(`💵 amount (u64) = ${amountU64}`);
 
-    // init root cache once (per test run) — DO NOT pass systemProgram (auto-resolved)
+    // ---- Initialize global TreeState (idempotent, same seeds as on-chain) ----
+    [treePda] = web3.PublicKey.findProgramAddressSync([TREE_SEED], programId);
+    console.log("🌲 tree PDA:", treePda.toBase58());
+
+    const preInfo = await connection.getAccountInfo(treePda);
+    console.log("📦 tree exists before init?", !!preInfo);
+
+    if (!preInfo) {
+      const genesisRoot = await computeZeroRoot(DEFAULT_DEPTH);
+      try {
+        await program.methods
+          .initializeTreeState(DEFAULT_DEPTH, Array.from(genesisRoot))
+          .accountsPartial({
+            tree: treePda,
+            authority: payer,
+            systemProgram: web3.SystemProgram.programId,
+          })
+          .rpc();
+        console.log("✅ initialize_tree_state ok");
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        if (/already.*in use/i.test(msg)) {
+          console.log("ℹ️ tree already exists (race)");
+        } else {
+          console.error("❌ initialize_tree_state failed:", msg);
+          throw e;
+        }
+      }
+    } else {
+      console.log("ℹ️ tree already exists");
+    }
+
+    // verify it really exists now
+    const postInfo = await connection.getAccountInfo(treePda);
+    if (!postInfo) {
+      throw new Error(
+        `TreeState PDA ${treePda.toBase58()} is still missing after init`
+      );
+    }
+
+    // ---- Initialize Root Cache (idempotent) ----
     try {
       await program.methods
         .initializeRootCache()
@@ -169,7 +241,7 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       console.log("ℹ️ root_cache already exists");
     }
 
-    // create a fresh mint with 0 decimals
+    // ---- SPL Mint & ATAs ----
     tokenMint = await createMint(
       connection,
       wallet.payer, // fee payer
@@ -179,7 +251,6 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
     );
     console.log("✅ token mint:", tokenMint.toBase58());
 
-    // derive PDAs + ATAs
     [vaultPda] = web3.PublicKey.findProgramAddressSync([VAULT_SEED], programId);
     payerAta = getAssociatedTokenAddressSync(
       tokenMint,
@@ -196,7 +267,6 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
-    // ensure ATAs exist (payer + vault)
     const createPayerAtaIx = await ensureAtaIx(
       connection,
       payerAta,
@@ -220,7 +290,6 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       console.log("✅ created missing ATAs");
     }
 
-    // mint funds to payer to cover transfer
     await mintTo(
       connection,
       wallet.payer,
@@ -233,7 +302,7 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
   });
 
   it("verifies on-chain via shielded_deposit_atomic (auto-match seeds)", async () => {
-    // the PDA for the per-deposit idempotent marker (what Anchor enforces)
+    // the PDA for the per-deposit idempotent marker
     const [depositMarkerPda] = web3.PublicKey.findProgramAddressSync(
       [DEPOSIT_SEED, depositHash],
       programId
@@ -242,9 +311,6 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
     // pre-ixs
     const cuIx = web3.ComputeBudgetProgram.setComputeUnitLimit({
       units: CU_LIMIT,
-    });
-    const feeIx = web3.ComputeBudgetProgram.setComputeUnitPrice({
-      microLamports: 0,
     });
 
     // SPL transfer (payer ATA -> vault ATA)
@@ -259,15 +325,17 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       TOKEN_PROGRAM_ID
     );
 
-    // Memo binds the deposit hash (hex string, readable)
-    const memoHex = "deposit:" + Buffer.from(depositHash).toString("hex");
-    const memoIx = createMemoInstruction(memoHex, [payer]);
+    const memoIx = createMemoInstruction(
+      "deposit:" + toHexLE(depositHash),
+      [payer]
+    );
 
     // Build the program instruction (Anchor)
     const mb = program.methods
       .shieldedDepositAtomic(depositHash, proofBytes, publicInputsBytes)
       .accountsPartial({
         payer,
+        tree: treePda, // REQUIRED by #[account(seeds=[TREE_SEED], bump)]
         rootCache: rootCache.publicKey,
         depositMarker: depositMarkerPda,
         vaultPda,
@@ -281,17 +349,10 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
 
     const anchorIx = await mb.instruction();
 
-    // IMPORTANT: put the Token transfer **immediately before** our program ix.
-    // Memo can come anywhere; we keep it too for your on-chain check.
-    const tx = new web3.Transaction().add(
-      cuIx,
-      feeIx,
-      memoIx,
-      transferIx, // <── adjacency to our program ix
-      anchorIx
-    );
+    // IMPORTANT: Token transfer **immediately before** our program ix
+    const tx = new web3.Transaction().add(cuIx, memoIx, transferIx, anchorIx);
 
-    // Pretty-print the built transaction so we can see what's inside *before* sending.
+    // Pretty-print the built transaction
     console.log("🔎 full tx instructions:");
     tx.instructions.forEach((ix, i) => {
       const pid = ix.programId.toBase58();
@@ -314,20 +375,7 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
       }
     });
 
-    // Quick local assert to catch missing/incorrect transfer before RPC:
-    const hasCorrectTransfer = tx.instructions.some(
-      (ix) =>
-        ix.programId.equals(TOKEN_PROGRAM_ID) &&
-        ix.keys.length >= 3 &&
-        ix.keys[2].pubkey.equals(vaultAta) // destination is 3rd key
-    );
-    if (!hasCorrectTransfer) {
-      throw new Error(
-        `DEBUG: built tx does not contain a spl-token transfer to expected vault ATA: ${vaultAta.toBase58()}`
-      );
-    }
-
-    // (Optional) print the account metas of the Anchor ix too
+    // (Optional) Anchor ix account metas
     console.log("🔎 ix.accounts:");
     anchorIx.keys.forEach((k, i) => {
       const w = k.isWritable ? " (writable)" : "";
@@ -360,7 +408,6 @@ describe("shielded_deposit_atomic (end-to-end) — seeds debug (auto-match Right
   });
 
   it("sanity: proof structure", () => {
-    // a/b/c segments for Groth16 proof
     const a = proofBytes.subarray(0, 64);
     const b = proofBytes.subarray(64, 192);
     const c = proofBytes.subarray(192, 256);

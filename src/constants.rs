@@ -1,9 +1,13 @@
 //! Program-wide constants
 
+use anchor_lang::prelude::Pubkey;   // brings `Pubkey` type into scope
+use anchor_lang::pubkey;            // brings the `pubkey!` macro into scope
 
 // =======================
 // PDA seeds (yours, kept)
 // =======================
+
+pub const PROGRAM_ADMIN: Pubkey = pubkey!("9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o");
 
 /// Deposit marker PDA: seeds = [b"deposit", deposit_hash]
 pub const DEPOSIT_MARKER_SEED: &[u8] = b"deposit";
@@ -19,6 +23,8 @@ pub const NULLIFIER_SEED: &[u8] = b"nullifier";
 /// Root cache PDA (ring buffer or single root, depending on your state design):
 /// seeds = [b"root_cache", mint] (or global, if you prefer)
 pub const MERKLE_ROOT_CACHE_SEED: &[u8] = b"root_cache";
+
+pub const TREE_SEED: &[u8] = b"tree";
 
 /// How many historical roots to store if you keep a ring-buffer cache.
 pub const MAX_ROOTS: usize = 128;
@@ -42,8 +48,8 @@ pub const PROOF_BYTES_LEN: usize = G1_BYTES + G2_BYTES + G1_BYTES; // 256
 // =====================================================
 
 /// deposit.circom publicSignals count:
-/// [newCommitment, ownerCipherPayPubKey, newMerkleRoot, newNextLeafIndex, amount, depositHash]
-pub const NPUB_DEPOSIT: usize = 6;
+/// [newCommitment, ownerCipherPayPubKey, newMerkleRoot, newNextLeafIndex, amount, depositHash, oldMerkleRoot]
+pub const NPUB_DEPOSIT: usize = 7;
 
 /// withdraw.circom publicSignals count:
 /// [nullifier, merkleRoot, recipientWalletPubKey, amount, tokenId]

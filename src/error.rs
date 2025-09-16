@@ -88,4 +88,9 @@ pub enum CipherPayError {
     /// Any guarded arithmetic that would wrap/underflow.
     #[msg("Arithmetic overflow or underflow.")]
     ArithmeticError,
+
+    #[msg("Old Merkle root does not match on-chain state.")]
+    OldRootMismatch,          // 0x1782 or next free code
+    #[msg("Next leaf index mismatch.")]
+    NextLeafIndexMismatch,    // next free code
 }

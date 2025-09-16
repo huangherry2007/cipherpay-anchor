@@ -33,7 +33,7 @@ pub const MAX_IC: usize = 64;
 
 // ---- Circuit-specific public counts ----------------------------------------
 // From compile logs (public inputs + public outputs)
-pub const DEPOSIT_N_PUBLIC: usize  = 6; // 2 in + 4 out
+pub const DEPOSIT_N_PUBLIC: usize  = 7; // 3 in + 4 out
 pub const TRANSFER_N_PUBLIC: usize = 9; // 2 in + 7 out
 pub const WITHDRAW_N_PUBLIC: usize = 5; // 3 in + 2 out
 
@@ -45,6 +45,7 @@ pub mod deposit_idx {
     pub const NEW_NEXT_LEAF_INDEX: usize    = 3;
     pub const AMOUNT: usize                 = 4;
     pub const DEPOSIT_HASH: usize           = 5;
+    pub const OLD_MERKLE_ROOT: usize        = 6;
 }
 pub mod transfer_idx {
     pub const OUT_COMMITMENT_1:    usize = 0;
