@@ -1,116 +1,173 @@
+// tests/withdraw.ts
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, Keypair } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { PublicKey, SystemProgram, Keypair, Connection } from "@solana/web3.js";
 import { assert } from "chai";
 import fs from "fs";
 import path from "path";
 
+import {
+  getAssociatedTokenAddressSync,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  createMint,
+} from "@solana/spl-token";
+
 import { CipherpayAnchor } from "../target/types/cipherpay_anchor";
 
-/**
- * TypeScript Integration Tests for Shielded Withdraw
- * 
- * Purpose: Real program integration testing with actual ZK proofs
- * Focus: Client-side withdraw workflows, real token transfers, real cryptographic validation
- * 
- * These tests complement the Rust unit tests by testing:
- * - Real program deployment and execution
- * - Actual ZK proof verification for withdrawals
- * - Real SPL token transfer operations
- * - Client-side integration patterns
- * - Production-like withdraw scenarios
- */
+// === Utility: Load proof, public signals, and nullifier ===
+function loadWithdrawProofAndSignals() {
+  const proof = fs.readFileSync(
+    path.resolve(__dirname, "../proofs/withdraw_proof.bin")
+  );
+  const publicSignals = fs.readFileSync(
+    path.resolve(__dirname, "../proofs/withdraw_public_signals.bin")
+  );
 
-// === Utility: Load proof, inputs, and nullifier ===
-function loadWithdrawProofAndInputs() {
-  const proof = fs.readFileSync(path.resolve(__dirname, `../proofs/withdraw_proof.bin`));
-  const publicInputs = fs.readFileSync(path.resolve(__dirname, `../proofs/withdraw_public_inputs.bin`));
-  
-  // Validate the new circuit structure: 3 signals for withdraw circuit
-  if (publicInputs.length !== 96) { // 3 signals × 32 bytes
-    throw new Error(`Expected 96 bytes for withdraw public inputs, got ${publicInputs.length}`);
+  // Your generator writes a 256-byte Groth16 proof
+  if (proof.length !== 256) {
+    throw new Error(`Expected 256-byte Groth16 proof, got ${proof.length}`);
   }
-  
-  // Extract nullifier from public inputs (signal 0 - index 0-31)
-  // The new withdraw circuit structure has 3 signals:
-  // Signal 0: Nullifier (0-31)
-  // Signal 1: Merkle root (32-63)
-  // Signal 2: Amount (64-95)
-  const nullifier = Buffer.from(publicInputs.subarray(0, 32));
-  
-  return { proof, publicInputs, nullifier };
+
+  // Withdraw circuit: 5 public signals -> 160 bytes
+  if (publicSignals.length !== 5 * 32) {
+    throw new Error(
+      `Expected 160 bytes for withdraw public signals, got ${publicSignals.length}`
+    );
+  }
+
+  // Signal order: [nullifier, merkleRoot, recipientWalletPubKey, amount, tokenId]
+  const nullifier = publicSignals.subarray(0, 32);
+
+  return { proof, publicSignals, nullifier };
 }
 
 describe("Shielded Withdraw - Real Program Integration", () => {
-  const provider = anchor.AnchorProvider.env();
+  // near the top of the test file (before anchor.setProvider)
+  const RPC_URL =
+    process.env.SOLANA_URL ||
+    process.env.ANCHOR_PROVIDER_URL ||
+    "http://127.0.0.1:8899";
+
+  const KEYPAIR_PATH =
+    process.env.ANCHOR_WALLET ||
+    `${process.env.HOME}/.config/solana/id.json`;
+
+  const payer = Keypair.fromSecretKey(
+    Buffer.from(JSON.parse(fs.readFileSync(KEYPAIR_PATH, "utf8")))
+  );
+
+  const connection = new Connection(RPC_URL, "confirmed");
+  const wallet = new anchor.Wallet(payer);
+  const provider = new anchor.AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+  });
+
   anchor.setProvider(provider);
 
   const program = anchor.workspace.CipherpayAnchor as Program<CipherpayAnchor>;
 
-  // Dummy accounts
+  // NOTE: these are placeholders; real test should use real SPL token accounts
   const vaultTokenAccount = Keypair.generate();
   const recipientTokenAccount = Keypair.generate();
   const rootCache = Keypair.generate();
-
-  it("Executes real shielded withdraw with ZK proof verification and token transfer", async () => {
-    const { proof, publicInputs, nullifier } = loadWithdrawProofAndInputs();
-
-    console.log("🔍 REAL WITHDRAW ZK PROOF VERIFICATION + TOKEN TRANSFER");
-    console.log("📊 Proof size:", proof.length, "bytes");
-    console.log("📋 Public inputs size:", publicInputs.length, "bytes");
-    console.log("🔐 Nullifier:", nullifier.toString('hex'));
-
-    const [vaultPda] = await PublicKey.findProgramAddressSync(
+  
+  it("Executes shielded withdraw with ZK proof verification", async () => {
+    const { proof, publicSignals, nullifier } = loadWithdrawProofAndSignals();
+  
+    // --- derive PDAs & create a real mint/ATAs (do this in your beforeAll in practice) ---
+    // 1) Create a mint for the test (or reuse the one from your deposit/transfer test)
+    const tokenMint = await createMint(
+      provider.connection,
+      (provider.wallet as any).payer,
+      provider.wallet.publicKey, // mint authority
+      null,                      // freeze authority
+      0                          // decimals
+    );
+  
+    // 2) Program vault PDA
+    const [vaultPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("vault")],
       program.programId
     );
-
-    const [nullifierRecordPda] = await PublicKey.findProgramAddressSync(
-      [Buffer.from("nullifier"), nullifier],
+  
+    // 3) Vault ATA (must be the true ATA PDA)
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      tokenMint,
+      vaultPda,
+      true,                      // ATA for a PDA owner
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+  
+    // 4) Recipient owner + ATA
+    const recipientOwner = provider.wallet.publicKey; // withdraw to the test wallet
+    const recipientTokenAccount = getAssociatedTokenAddressSync(
+      tokenMint,
+      recipientOwner,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+  
+    // 5) Nullifier PDA (IDL wants it in accounts)
+    const [nullifierRecord] = PublicKey.findProgramAddressSync(
+      [Buffer.from("nullifier"), Buffer.from(nullifier)],
       program.programId
     );
-
-    // Core test - real ZK proof verification + actual token transfer
-    const tx = await program.methods
-      .shieldedWithdraw([...nullifier], [...proof], [...publicInputs])
-      .accounts({
+  
+    // NOTE: make sure rootCache exists & contains the withdraw merkle root.
+    // Typically: run deposit -> transfer first (which updates rootCache),
+    // or include those steps here. Otherwise you’ll hit UnknownMerkleRoot.
+  
+    // --- call the instruction (use accountsPartial while iterating) ---
+    const sig = await program.methods
+      .shieldedWithdraw(Array.from(nullifier), proof, publicSignals)
+      .accountsPartial({
+        nullifierRecord,
+        rootCache: rootCache.publicKey, // ensure you've created it with initializeRootCache
         authority: provider.wallet.publicKey,
         vaultPda,
-        rootCache: rootCache.publicKey,
-        nullifierRecord: nullifierRecordPda,
-        vaultTokenAccount: vaultTokenAccount.publicKey,
-        recipientTokenAccount: recipientTokenAccount.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        vaultTokenAccount,
+        recipientTokenAccount,
+        recipientOwner,
+        tokenMint,
         systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       })
-      .signers([]) // PDAs don't need to sign
       .rpc();
-
-    console.log("✅ REAL withdraw ZK proof verification + token transfer successful:", tx);
+  
+    console.log("✅ withdraw sent:", sig);
   });
+  
+  it("Validates withdraw circuit outputs & sizes", async () => {
+    const { proof, publicSignals } = loadWithdrawProofAndSignals();
 
-  it("Validates real withdraw circuit structure and data", async () => {
-    const { proof, publicInputs } = loadWithdrawProofAndInputs();
-    
-    console.log("🔍 REAL WITHDRAW CIRCUIT VALIDATION");
-    console.log("📏 Proof size:", proof.length, "bytes (expected: 512)");
-    console.log("📏 Public inputs size:", publicInputs.length, "bytes (expected: 96)");
-    
-    // Validate proof structure for groth16-solana compatibility
-    assert.equal(proof.length, 512, "Proof should be 512 bytes for Groth16");
-    assert.equal(publicInputs.length, 96, "Public inputs should be 96 bytes (3 signals × 32 bytes)");
-    
-    // Extract and display real circuit signals
-    const nullifier = publicInputs.subarray(0, 32);
-    const merkleRoot = publicInputs.subarray(32, 64);
-    const amount = publicInputs.subarray(64, 96);
-    
-    console.log("📋 Real withdraw circuit signals:");
-    console.log("   Signal 0 (Nullifier):", nullifier.toString('hex'));
-    console.log("   Signal 1 (Merkle Root):", merkleRoot.toString('hex'));
-    console.log("   Signal 2 (Amount):", amount.toString('hex'));
-    
-    console.log("✅ Real withdraw circuit validation passed");
+    console.log("🔍 WITHDRAW CIRCUIT VALIDATION");
+    console.log("📏 Proof size:", proof.length, "(expected: 256)");
+    console.log("📏 Public signals size:", publicSignals.length, "(expected: 160)");
+
+    assert.equal(proof.length, 256, "Groth16 proof should be 256 bytes");
+    assert.equal(
+      publicSignals.length,
+      160,
+      "Withdraw public signals should be 160 bytes (5 × 32)"
+    );
+
+    const s0_nullifier = publicSignals.subarray(0, 32);
+    const s1_merkleRoot = publicSignals.subarray(32, 64);
+    const s2_recipientWalletPubKey = publicSignals.subarray(64, 96);
+    const s3_amount = publicSignals.subarray(96, 128);
+    const s4_tokenId = publicSignals.subarray(128, 160);
+
+    console.log("📋 Signals (LE hex):");
+    console.log("   0 nullifier              :", Buffer.from(s0_nullifier).toString("hex"));
+    console.log("   1 merkleRoot             :", Buffer.from(s1_merkleRoot).toString("hex"));
+    console.log("   2 recipientWalletPubKey  :", Buffer.from(s2_recipientWalletPubKey).toString("hex"));
+    console.log("   3 amount                 :", Buffer.from(s3_amount).toString("hex"));
+    console.log("   4 tokenId                :", Buffer.from(s4_tokenId).toString("hex"));
+
+    console.log("✅ Withdraw circuit validation passed");
   });
 });
