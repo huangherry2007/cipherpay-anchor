@@ -5,7 +5,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Token, TokenAccount};
 
-use crate::constants::{DEPOSIT_MARKER_SEED, NULLIFIER_SEED, VAULT_SEED, TREE_SEED};
+use crate::constants::{DEPOSIT_MARKER_SEED, NULLIFIER_SEED, VAULT_SEED, TREE_SEED, ROOT_CACHE_SEED};
 use crate::state::*;
 
 /// Initialize the global Merkle tree state (one per deployment/cluster)
@@ -43,15 +43,18 @@ pub struct InitializeRootCache<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + MerkleRootCache::SIZE
+        space = 8 + MerkleRootCache::SIZE,
+        seeds = [ROOT_CACHE_SEED],
+        bump
     )]
-    pub root_cache: Account<'info, MerkleRootCache>,
+    pub root_cache: AccountLoader<'info, MerkleRootCache>,
 
     #[account(mut)]
     pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
+
 
 /// (Optional/no-op in your model) SPL token deposit helper
 #[derive(Accounts)]
@@ -86,7 +89,7 @@ pub struct ShieldedDepositAtomic<'info> {
     pub tree: Account<'info, TreeState>,
 
     #[account(mut)]
-    pub root_cache: Account<'info, MerkleRootCache>,
+    pub root_cache: AccountLoader<'info, MerkleRootCache>,
 
     #[account(
         init,
@@ -124,7 +127,7 @@ pub struct ShieldedTransfer<'info> {
 
     /// Rolling root cache (useful for withdraws/telemetry)
     #[account(mut)]
-    pub root_cache: Account<'info, MerkleRootCache>,
+    pub root_cache: AccountLoader<'info, MerkleRootCache>,
 
     /// Nullifier record: one-time use
     #[account(
@@ -157,7 +160,7 @@ pub struct ShieldedWithdraw<'info> {
     pub nullifier_record: Account<'info, Nullifier>,
 
     #[account(mut)]
-    pub root_cache: Account<'info, MerkleRootCache>,
+    pub root_cache: AccountLoader<'info, MerkleRootCache>,
 
     #[account(mut)]
     pub authority: Signer<'info>,

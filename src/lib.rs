@@ -26,7 +26,7 @@ use crate::utils::{
 #[cfg(feature = "real-crypto")]
 use crate::zk_verifier::solana_verifier;
 
-declare_id!("9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o");
+declare_id!("56nPWpjBLbh1n8vvUdCYGmg3dS5zNwLW9UhCg4MMpBmN");
 
 pub mod constants;
 pub mod context;
@@ -86,11 +86,13 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Create an empty Merkle root cache.
     pub fn initialize_root_cache(ctx: Context<InitializeRootCache>) -> Result<()> {
-        ctx.accounts.root_cache.roots = Vec::new();
+        let mut cache = ctx.accounts.root_cache.load_init()?;
+        cache.clear();
+        msg!("root_cache initialized: next_slot={}, count={}", cache.next_slot, cache.count);
         Ok(())
     }
+    
 
     pub fn initialize_tree_state(ctx: Context<InitializeTreeState>, depth: u8, genesis_root: [u8;32]) -> Result<()> {
         let t = &mut ctx.accounts.tree;
