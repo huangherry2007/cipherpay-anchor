@@ -94,7 +94,7 @@ pub struct ShieldedDepositAtomic<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + DepositMarker::SPACE,
+        space = DepositMarker::SPACE,
         seeds = [DEPOSIT_MARKER_SEED, deposit_hash.as_ref()],
         bump
     )]
