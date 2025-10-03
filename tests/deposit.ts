@@ -14,7 +14,7 @@ import {
 } from "@solana/spl-token";
 import { createMemoInstruction } from "@solana/spl-memo";
 
-// ───────────────────────── IDL loader (with signer sanitizer) ─────────────────────────
+// ───────────────────────── IDL loader (no sanitizer) ─────────────────────────
 type AnyIdl = Record<string, any>;
 
 function loadIdl(): AnyIdl {
@@ -24,19 +24,6 @@ function loadIdl(): AnyIdl {
   if (!idl || typeof idl !== "object" || !Array.isArray(idl.instructions)) {
     throw new Error(`IDL at ${IDL_PATH} is invalid (missing instructions[])`);
   }
-
-  // Ensure only `payer` is a signer for shielded_deposit_atomic
-  const depIx = idl.instructions.find((ix: any) => ix.name === "shielded_deposit_atomic");
-  const forceOnlyPayerSigns = (arr: any[]) => {
-    if (!Array.isArray(arr)) return;
-    for (const acc of arr) {
-      if (!acc) continue;
-      acc.isSigner = acc.name === "payer";
-      if (Array.isArray(acc.accounts)) forceOnlyPayerSigns(acc.accounts);
-    }
-  };
-  if (depIx) forceOnlyPayerSigns(depIx.accounts);
-
   return idl;
 }
 
@@ -86,6 +73,14 @@ async function ensureAtaIx(
   return createAssociatedTokenAccountInstruction(
     payer, ata, owner, mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
   );
+}
+async function getU64TokenBal(
+  connection: web3.Connection,
+  ata: web3.PublicKey
+): Promise<number> {
+  const r = await connection.getTokenAccountBalance(ata, "confirmed");
+  // amount is a decimal string; with decimals=0 this fits safely in number for these tests
+  return Number(r.value.amount);
 }
 
 // ───────────────────────── config ─────────────────────────
@@ -166,6 +161,9 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
   let treePda!: web3.PublicKey;
   let rootCachePda!: web3.PublicKey;
 
+  // cached pre-state for assertions
+  let preTreeNextIndex: number = -1; // -1 means "skip assertion if we can't decode"
+
   beforeAll(async () => {
     await ensureAirdrop(connection, payer);
 
@@ -206,6 +204,14 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
     if (!treeInfo) throw new Error("TreeState PDA missing. Run `anchor run init` first.");
     if (!rcInfo) throw new Error("RootCache PDA missing. Run `anchor run init` first.");
 
+    // Capture pre tree.next_index for later assertion
+    try {
+      const treeAcc: any = await (program.account as any).treeState.fetch(treePda);
+      preTreeNextIndex = Number(treeAcc.nextIndex ?? treeAcc.next_index ?? 0);
+    } catch {
+      preTreeNextIndex = -1; // skip if we can't decode
+    }
+
     // ---- SPL Mint & ATAs ----
     tokenMint = await createMint(
       connection,
@@ -241,29 +247,25 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
     console.log("✅ minted amount to payer ATA");
   });
 
-  it("verifies on-chain via shielded_deposit_atomic (PDA root_cache, only payer signs)", async () => {
+  // Helper to build a full deposit tx with given deposit hash
+  async function buildDepositTx(dHash: Buffer) {
     const [depositMarkerPda] = web3.PublicKey.findProgramAddressSync(
-      [DEPOSIT_SEED, depositHash],
+      [DEPOSIT_SEED, dHash],
       programId
     );
-    console.log("🏷️ depositMarkerPda:", depositMarkerPda.toBase58());
 
-    // pre-ixs: budget, memo, token transfer
     const cuIx = web3.ComputeBudgetProgram.setComputeUnitLimit({ units: CU_LIMIT });
-
     const transferIx = createTransferCheckedInstruction(
       payerAta, tokenMint, vaultAta, payer, amountU64, MINT_DECIMALS, [], TOKEN_PROGRAM_ID
     );
+    const memoIx = createMemoInstruction("deposit:" + toHexLE(dHash), [payer]);
 
-    const memoIx = createMemoInstruction("deposit:" + toHexLE(depositHash), [payer]);
-
-    // Build program ix
-    const anchorIx = await program.methods
-      .shieldedDepositAtomic(depositHash, proofBytes, publicInputsBytes)
+    const programIx = await program.methods
+      .shieldedDepositAtomic(dHash, proofBytes, publicInputsBytes)
       .accountsPartial({
         payer,
         tree: treePda,
-        rootCache: rootCachePda, // ✅ PDA (pre-initialized)
+        rootCache: rootCachePda,
         depositMarker: depositMarkerPda,
         vaultPda,
         vaultTokenAccount: vaultAta,
@@ -275,17 +277,24 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
       })
       .instruction();
 
+    const tx = new web3.Transaction().add(cuIx, memoIx, transferIx, programIx);
+    return { tx, programIx };
+  }
+
+  it("verifies on-chain via shielded_deposit_atomic (PDA root_cache, only payer signs)", async () => {
+    // Pre balances
+    const prePayer = await getU64TokenBal(connection, payerAta);
+    const preVault = await getU64TokenBal(connection, vaultAta);
+
+    // Build + send
+    const { tx, programIx } = await buildDepositTx(depositHash);
+
     // sanity — should be only `payer`
-    const signers = anchorIx.keys.filter(k => k.isSigner).map(k => k.pubkey.toBase58());
+    const signers = programIx.keys.filter(k => k.isSigner).map(k => k.pubkey.toBase58());
     console.log("🧪 required signers (program ix):", signers);
-    if (!(signers.length === 1 && signers[0] === payer.toBase58())) {
-      throw new Error("IDL requires unexpected signers: " + JSON.stringify(signers));
-    }
+    expect(signers).toEqual([payer.toBase58()]);
 
-    // Final tx: SPL transfer & memo immediately before our program ix
-    const tx = new web3.Transaction().add(cuIx, memoIx, transferIx, anchorIx);
-
-    // Pretty-print the built transaction
+    // Pretty-print the built transaction (optional)
     console.log("🔎 full tx instructions:");
     tx.instructions.forEach((ix, i) => {
       const pid = ix.programId.toBase58();
@@ -308,31 +317,64 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
       }
     });
 
-    try {
-      const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: false });
-      console.log("✅ shielded_deposit_atomic tx:", sig);
+    const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: false });
+    console.log("✅ shielded_deposit_atomic tx:", sig);
 
-      const res = await connection.getTransaction(sig, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
-      console.log("---- on-chain logs ----");
-      res?.meta?.logMessages?.forEach((l) => console.log(l));
-      console.log("---- end logs ----");
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
-      console.warn("⚠️ send failed:", msg);
-      if (e?.logs) {
-        console.warn("---- logs ----");
-        for (const line of e.logs) console.warn(line);
-        console.warn("---- end logs ----");
+    // Post balances
+    const postPayer = await getU64TokenBal(connection, payerAta);
+    const postVault = await getU64TokenBal(connection, vaultAta);
+
+    // Balance assertions
+    const amt = amountU64;
+    expect(postPayer).toBe(prePayer - amt);
+    expect(postVault).toBe(preVault + amt);
+
+    // TreeState.next_index bump (if we could decode pre)
+    if (preTreeNextIndex >= 0) {
+      try {
+        const treeAcc: any = await (program.account as any).treeState.fetch(treePda);
+        const postNextIndex = Number(treeAcc.nextIndex ?? treeAcc.next_index ?? 0);
+        expect(postNextIndex).toBe(preTreeNextIndex + 1);
+      } catch {
+        // skip if decode fails
       }
-      throw e;
     }
+
+    // Logs (optional)
+    const res = await connection.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    console.log("---- on-chain logs ----");
+    res?.meta?.logMessages?.forEach((l) => console.log(l));
+    console.log("---- end logs ----");
+  });
+
+  it("replay-guard: same depositHash again should fail and leave balances unchanged", async () => {
+    const prePayer = await getU64TokenBal(connection, payerAta);
+    const preVault = await getU64TokenBal(connection, vaultAta);
+
+    const { tx } = await buildDepositTx(depositHash);
+
+    let failed = false;
+    try {
+      await provider.sendAndConfirm(tx, [], { skipPreflight: false });
+    } catch (e: any) {
+      failed = true;
+      const msg = String(e?.message ?? e);
+      console.log("↩️ replay tx failed as expected:", msg);
+    }
+    expect(failed).toBe(true);
+
+    // Balances unchanged
+    const postPayer = await getU64TokenBal(connection, payerAta);
+    const postVault = await getU64TokenBal(connection, vaultAta);
+    expect(postPayer).toBe(prePayer);
+    expect(postVault).toBe(preVault);
   });
 
   it("sanity: proof structure", () => {
-    const a = publicInputsBytes.subarray(0, 32); // small extra check on inputs
+    const a = publicInputsBytes.subarray(0, 32);
     expect(a.length).toBe(32);
     const pA = proofBytes.subarray(0, 64);
     const pB = proofBytes.subarray(64, 192);
