@@ -26,7 +26,7 @@ impl DepositMarker {
 /// Optional on-chain nullifier record (if you decide to persist spent notes).
 #[account]
 pub struct NullifierRecord {
-    pub processed: bool,
+    pub used: bool,
     pub bump: u8,
 }
 impl NullifierRecord {

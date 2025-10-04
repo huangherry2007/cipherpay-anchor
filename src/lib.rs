@@ -222,8 +222,8 @@ pub mod cipherpay_anchor {
     
         // --- idempotency: nullifier record ---
         let rec = &mut ctx.accounts.nullifier_record;
-        require!(!rec.processed, CipherPayError::AlreadyProcessed);
-        rec.processed = true;
+        require!(!rec.used, CipherPayError::AlreadyProcessed);
+        rec.used = true;
         rec.bump = ctx.bumps.nullifier_record;   // ← keep only fields that exist
     
         // --- verify + parse public signals ---
