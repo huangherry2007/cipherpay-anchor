@@ -277,80 +277,171 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Spend one note, withdraw SPL tokens from the program’s vault ATA to the recipient.
     pub fn shielded_withdraw(
         ctx: Context<ShieldedWithdraw>,
-        nullifier: [u8; 32],
+        nullifier: Vec<u8>,
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
+        // -------------------- 0) Byte-size sanity (cheap, first) --------------------
+        require_eq!(
+            nullifier.len(),
+            32,
+            CipherPayError::InvalidInput
+        );
+        // Groth16 proof should be 256 bytes (a, b, c + padding) for BN254
+        require_eq!(
+            proof_bytes.len(),
+            256,
+            CipherPayError::InvalidProofBytesLength
+        );
+        // Withdraw publics = 5 * 32 = 160 bytes
+        require_eq!(
+            public_inputs_bytes.len(),
+            5 * 32,
+            CipherPayError::InvalidPublicInputsLength
+        );
+    
+        // Make fixed-size views; avoids Vec allocations/copies
+        let nf32: &[u8; 32] = public_inputs_bytes[0..32]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+        let root32: &[u8; 32] = public_inputs_bytes[32..64]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+        let _recipient_pk32: &[u8; 32] = public_inputs_bytes[64..96]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+        let amount_fe32: &[u8; 32] = public_inputs_bytes[96..128]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+        let _token_id32: &[u8; 32] = public_inputs_bytes[128..160]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+    
+        // Caller-provided nullifier must equal public input nullifier
+        require!(
+            nullifier.as_slice() == &nf32[..],
+            CipherPayError::NullifierMismatch
+        );
+    
+        // Parse u64 amount from first 8 bytes (little-endian) of the 32-byte field element
+        let amount_u64 = {
+            let mut tmp = [0u8; 8];
+            tmp.copy_from_slice(&amount_fe32[0..8]);
+            u64::from_le_bytes(tmp)
+        };
+        // Optional sanity: require non-zero amount (up to you)
+        // require!(amount_u64 > 0, CipherPayError::InvalidWithdrawAmount);
+    
+        // -------------------- 1) Cheap state checks (before verifier) --------------------
+        // Nullifier must not be used yet (idempotency)
+        let rec = &mut ctx.accounts.nullifier_record;
+        require!(!rec.used, CipherPayError::AlreadyProcessed);
+    
+        // Root must be in cache (prevents verifier work if invalid)
+        require!(
+            is_valid_root(root32, &ctx.accounts.root_cache),
+            CipherPayError::UnknownMerkleRoot
+        );
+    
+        // Vault ATA must be (mint = token_mint, owner = vault_pda)
+        require_keys_eq!(
+            ctx.accounts.vault_token_account.mint,
+            ctx.accounts.token_mint.key(),
+            CipherPayError::VaultMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.vault_token_account.owner,
+            ctx.accounts.vault_pda.key(),
+            CipherPayError::VaultAuthorityMismatch
+        );
+    
+        // Recipient ATA must be (mint = token_mint, owner = recipient_owner)
+        require_keys_eq!(
+            ctx.accounts.recipient_token_account.mint,
+            ctx.accounts.token_mint.key(),
+            CipherPayError::InvalidInput
+        );
+        require_keys_eq!(
+            ctx.accounts.recipient_token_account.owner,
+            ctx.accounts.recipient_owner.key(),
+            CipherPayError::InvalidInput
+        );
+    
+        // -------------------- 2) Proof verification (after cheap guards) --------------------
         #[cfg(feature = "real-crypto")]
         {
+            // Verify Groth16 proof; use bounded parsing internally
             solana_verifier::verify_withdraw(&proof_bytes, &public_inputs_bytes)
                 .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
+    
+            // (Optional, belt-and-suspenders) Re-parse exact publics and re-check consistency
             let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
                 .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
-
-            let nf_from_snark = sigs[withdraw_idx::NULLIFIER];
-            let merkle_root   = sigs[withdraw_idx::MERKLE_ROOT];
-            let recipient_pk  = sigs[withdraw_idx::RECIPIENT_WALLET_PUBKEY];
-            let amount_fe     = sigs[withdraw_idx::AMOUNT];
-            let _token_id     = sigs[withdraw_idx::TOKEN_ID];
-
-            require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
-
-            let rec = &mut ctx.accounts.nullifier_record;
-            require!(!rec.processed, CipherPayError::NullifierAlreadyUsed);
-            rec.processed = true;
-            rec.bump = ctx.bumps.nullifier_record;
-
-            require!(is_valid_root(&merkle_root, &ctx.accounts.root_cache), CipherPayError::UnknownMerkleRoot);
-
-            // FE (LE) -> u64
-            let mut amount: u64 = 0;
-            for i in 0..8 { amount |= (amount_fe[i] as u64) << (8 * i); }
-
-            // Transfer SPL from program vault ATA to recipient ATA.
-            let cpi_accounts = SplTransfer {
-                from: ctx.accounts.vault_token_account.to_account_info(),
-                to: ctx.accounts.recipient_token_account.to_account_info(),
+    
+            // Indices consistent with your circuit:
+            // 0:nullifier, 1:root, 2:recipient, 3:amount, 4:tokenId  (adjust if needed)
+            const NULLIFIER_IDX: usize = 0;
+            const ROOT_IDX: usize = 1;
+            const AMOUNT_IDX: usize = 3;
+    
+            require!(sigs[NULLIFIER_IDX] == *nf32, CipherPayError::InvalidZkProof);
+            require!(sigs[ROOT_IDX] == *root32, CipherPayError::InvalidZkProof);
+    
+            // Optionally re-derive amount and compare first 8 bytes:
+            let amt_fe = sigs[AMOUNT_IDX];
+            let mut amt_chk = [0u8; 8];
+            amt_chk.copy_from_slice(&amt_fe[0..8]);
+            require!(
+                u64::from_le_bytes(amt_chk) == amount_u64,
+                CipherPayError::InvalidZkProof
+            );
+        }
+    
+        #[cfg(not(feature = "real-crypto"))]
+        {
+            // Stub: we already parsed from public_inputs_bytes.
+            // Do nothing here—this preserves realistic amount & root for tests.
+        }
+    
+        // -------------------- 3) CPI: vault -> recipient (if amount > 0) --------------------
+        if amount_u64 > 0 {
+            // signer seeds for vault_pda = [b"vault", [bump]]
+            let vault_bump = ctx.bumps.vault_pda;
+            let bump = [vault_bump];
+            let signer_seeds: &[&[u8]] = &[VAULT_SEED, &bump];
+            let signer: &[&[&[u8]]] = &[signer_seeds];
+    
+            let cpi_accounts = anchor_spl::token::Transfer {
+                from:      ctx.accounts.vault_token_account.to_account_info(),
+                to:        ctx.accounts.recipient_token_account.to_account_info(),
                 authority: ctx.accounts.vault_pda.to_account_info(),
             };
-
-            let bump = ctx.bumps.vault_pda;
-            let seeds: &[&[u8]] = &[VAULT_SEED, &[bump]];
-            let signer: &[&[&[u8]]] = &[seeds];
-
+    
             let cpi_ctx = CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 cpi_accounts,
                 signer,
             );
-            token::transfer(cpi_ctx, amount).map_err(|_| error!(CipherPayError::TokenTransferFailed))?;
-
-            emit!(WithdrawCompleted {
-                nullifier,
-                recipient: ctx.accounts.recipient_owner.key(),
-                amount,
-                mint: ctx.accounts.token_mint.key(),
-            });
+    
+            anchor_spl::token::transfer(cpi_ctx, amount_u64)
+                .map_err(|_| error!(CipherPayError::TokenTransferFailed))?;
         }
-
-        #[cfg(not(feature = "real-crypto"))]
-        {
-            let rec = &mut ctx.accounts.nullifier_record;
-            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
-            rec.used = true;
-            rec.bump = ctx.bumps.nullifier_record;
-
-            emit!(WithdrawCompleted {
-                nullifier,
-                recipient: ctx.accounts.recipient_owner.key(),
-                amount: 0,
-                mint: ctx.accounts.token_mint.key(),
-            });
-        }
-
+    
+        // -------------------- 4) Mark nullifier as used (only after success) --------------------
+        rec.used = true;
+        rec.bump = ctx.bumps.nullifier_record;
+    
+        // -------------------- 5) Emit event --------------------
+        emit!(WithdrawCompleted {
+            nullifier: *nf32,
+            merkle_root_used: *root32,
+            amount: amount_u64,
+            mint: ctx.accounts.token_mint.key(),
+            recipient: ctx.accounts.recipient_owner.key(),
+        });
+    
         Ok(())
     }
 }

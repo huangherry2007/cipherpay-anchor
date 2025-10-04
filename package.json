@@ -7,9 +7,9 @@
     "test": "anchor test",
     "test:deposit": "jest tests/deposit.ts",
     "test:transfer": "jest tests/transfer.ts",
+    "test:withdraw": "jest tests/withdraw.ts",
     "test:deposit_transfer": "jest tests/deposit_transfer.ts",
     "test:all": "jest tests/deposit_transfer_withdraw.ts",
-    "test:withdraw": "jest tests/withdraw.ts",
     "test:quick": "anchor test --grep 'vault|USDC|deposit_tokens'",
     "build": "anchor build",
     "deploy": "anchor deploy"

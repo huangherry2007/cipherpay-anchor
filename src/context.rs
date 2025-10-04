@@ -3,7 +3,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::token::{Mint,Token, TokenAccount};
 
 use crate::constants::{DEPOSIT_MARKER_SEED, NULLIFIER_SEED, VAULT_SEED, TREE_SEED, ROOT_CACHE_SEED};
 use crate::state::*;
@@ -125,38 +125,47 @@ pub struct ShieldedTransfer<'info> {
     pub system_program: Program<'info, System>,
 }
 
-
-/// Nullifier record + program vault for shielded withdraw
+/// Shielded withdraw:
+/// - Only `payer` signs
+/// - We **do not** mutate the TreeState here
+/// - We check the spent root against the rolling root cache
 #[derive(Accounts)]
-#[instruction(nullifier: [u8; 32])]
+#[instruction(nullifier: Vec<u8>, _proof: Vec<u8>, _publics: Vec<u8>)]
 pub struct ShieldedWithdraw<'info> {
+    /// Fee payer / only signer.
+    #[account(mut, signer)]
+    pub payer: Signer<'info>,
+
+    /// Rolling Merkle roots cache (PDA, zero-copy).
+    #[account(mut, seeds = [ROOT_CACHE_SEED], bump)]
+    pub root_cache: AccountLoader<'info, MerkleRootCache>,
+
+    /// Per-withdraw nullifier record: prevents replay (idempotent).
     #[account(
-        init,
-        seeds = [NULLIFIER_SEED, &nullifier],
-        bump,
-        payer = authority,
-        space = 8 + NullifierRecord::SIZE
+        init_if_needed,
+        payer = payer,
+        space = 8 + NullifierRecord::SIZE,
+        seeds = [NULLIFIER_SEED, nullifier.as_ref()],
+        bump
     )]
     pub nullifier_record: Account<'info, NullifierRecord>,
 
-    #[account(mut)]
-    pub root_cache: AccountLoader<'info, MerkleRootCache>,
-
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// Program vault PDA (authority of the vault ATA).
+    /// Program vault authority PDA (signs CPIs with seeds).
+    /// CHECK: PDA only used as a signer for token CPI via seeds.
     #[account(seeds = [VAULT_SEED], bump)]
-    /// CHECK: PDA authority only for signing CPIs with seeds.
     pub vault_pda: UncheckedAccount<'info>,
 
-    /// Program vault ATA for the mint being withdrawn.
+    /// Program vault ATA for the selected mint.
     #[account(
         mut,
         associated_token::mint = token_mint,
         associated_token::authority = vault_pda
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
+
+    /// Recipient’s wallet (ATA authority). **Not a signer**.
+    /// CHECK: Used only as the ATA authority public key.
+    pub recipient_owner: UncheckedAccount<'info>,
 
     /// Recipient’s ATA for the same mint.
     #[account(
@@ -166,15 +175,11 @@ pub struct ShieldedWithdraw<'info> {
     )]
     pub recipient_token_account: Account<'info, TokenAccount>,
 
-    /// Owner of the recipient ATA (will receive funds).
-    #[account(mut)]
-    pub recipient_owner: Signer<'info>,
-
-    /// Mint being withdrawn (must match both ATAs).
-    /// CHECK: used for ATA constraints only.
-    pub token_mint: UncheckedAccount<'info>,
+    /// Mint being withdrawn.
+    pub token_mint: Account<'info, Mint>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
+

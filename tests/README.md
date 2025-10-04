@@ -290,3 +290,5 @@ ANCHOR_WALLET=~/.config/solana/id.json \
 anchor run init
 step 5:
 npm run test:deposit
+npm run test:transfer
+npm run test:withdraw
