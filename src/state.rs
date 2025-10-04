@@ -25,21 +25,13 @@ impl DepositMarker {
 
 /// Optional on-chain nullifier record (if you decide to persist spent notes).
 #[account]
-pub struct Nullifier {
-    /// Whether this nullifier has been seen/used
-    pub used: bool,
-    /// PDA bump
+pub struct NullifierRecord {
+    pub processed: bool,
     pub bump: u8,
 }
-
-impl Nullifier {
+impl NullifierRecord {
     pub const SIZE: usize = 1 + 1;
     pub const SPACE: usize = 8 + Self::SIZE;
-
-    #[inline]
-    pub fn mark_used(&mut self) {
-        self.used = true;
-    }
 }
 
 #[account]

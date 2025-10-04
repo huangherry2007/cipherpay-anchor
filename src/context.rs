@@ -118,33 +118,36 @@ pub struct ShieldedDepositAtomic<'info> {
     pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
 }
 
+/// Spend one input (nullifier) and append two outputs.
+/// Only `payer` signs (covers rent for the nullifier record).
 #[derive(Accounts)]
-#[instruction(nullifier: [u8; 32])]
+#[instruction(nullifier: Vec<u8>, _proof: Vec<u8>, _publics: Vec<u8>)]
 pub struct ShieldedTransfer<'info> {
-    /// The global tree state (strict sync mode: must match proof's spent root)
+    /// Fee payer / only signer.
+    #[account(mut, signer)]
+    pub payer: Signer<'info>,
+
+    /// Global Merkle tree (strict sync with proof’s spent root).
     #[account(mut, seeds = [TREE_SEED], bump)]
     pub tree: Account<'info, TreeState>,
 
-    /// Rolling root cache (useful for withdraws/telemetry)
-    #[account(mut)]
+    /// Rolling cache of recent roots (zero-copy account).
+    #[account(mut, seeds = [ROOT_CACHE_SEED], bump)]
     pub root_cache: AccountLoader<'info, MerkleRootCache>,
 
-    /// Nullifier record: one-time use
+    /// Per-nullifier one-shot PDA; prevents double-spends.
     #[account(
         init_if_needed,
         payer = payer,
-        space = 8 + Nullifier::SIZE,
-        seeds = [NULLIFIER_SEED, &nullifier],
+        space = 8 + NullifierRecord::SIZE,   // or ::SPACE if you defined it
+        seeds = [NULLIFIER_SEED, nullifier.as_ref()],  // <- use the *instruction arg* bytes
         bump
     )]
-    pub nullifier_record: Account<'info, Nullifier>,
-
-    /// Payer for rent when creating the nullifier record
-    #[account(mut)]
-    pub payer: Signer<'info>,
+    pub nullifier_record: Account<'info, NullifierRecord>,
 
     pub system_program: Program<'info, System>,
 }
+
 
 /// Nullifier record + program vault for shielded withdraw
 #[derive(Accounts)]
@@ -155,9 +158,9 @@ pub struct ShieldedWithdraw<'info> {
         seeds = [NULLIFIER_SEED, &nullifier],
         bump,
         payer = authority,
-        space = 8 + Nullifier::SIZE
+        space = 8 + NullifierRecord::SIZE
     )]
-    pub nullifier_record: Account<'info, Nullifier>,
+    pub nullifier_record: Account<'info, NullifierRecord>,
 
     #[account(mut)]
     pub root_cache: AccountLoader<'info, MerkleRootCache>,

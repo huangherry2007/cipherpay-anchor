@@ -94,4 +94,7 @@ pub enum CipherPayError {
     OldRootMismatch,          // 0x1782 or next free code
     #[msg("Next leaf index mismatch.")]
     NextLeafIndexMismatch,    // next free code
+
+    #[msg("Already processed")]
+    AlreadyProcessed,            // used by deposit marker + nullifier record
 }

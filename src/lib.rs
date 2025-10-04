@@ -36,8 +36,16 @@ pub mod state;
 pub mod utils;
 pub mod zk_verifier;
 
-fn fe32_to_u32_le(fe: [u8; 32]) -> u32 {
-    u32::from_le_bytes([fe[0], fe[1], fe[2], fe[3]])
+fn parse_transfer_publics(bytes: &[u8]) -> Result<[[u8; 32]; 9]> {
+    require!(bytes.len() == 9 * 32, CipherPayError::InvalidInput);
+    let mut out = [[0u8; 32]; 9];
+    for i in 0..9 {
+        out[i].copy_from_slice(&bytes[i*32..(i+1)*32]);
+    }
+    Ok(out)
+}
+fn u32_le(x: &[u8; 32]) -> u32 {
+    u32::from_le_bytes([x[0], x[1], x[2], x[3]])
 }
 
 #[program]
@@ -208,95 +216,69 @@ pub mod cipherpay_anchor {
 
     pub fn shielded_transfer(
         ctx: Context<ShieldedTransfer>,
-        nullifier: [u8; 32],
+        nullifier: Vec<u8>,
         proof_bytes: Vec<u8>,
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
+        // --- basic input checks ---
+        require!(nullifier.len() == 32, CipherPayError::InvalidInput);
+        let mut nf32 = [0u8; 32];
+        nf32.copy_from_slice(&nullifier);
+    
+        // --- idempotency: nullifier record ---
+        let rec = &mut ctx.accounts.nullifier_record;
+        require!(!rec.processed, CipherPayError::AlreadyProcessed);
+        rec.processed = true;
+        rec.bump = ctx.bumps.nullifier_record;   // ← keep only fields that exist
+    
+        // --- verify + parse public signals ---
         #[cfg(feature = "real-crypto")]
         {
-            // 0) Verify the ZK proof and parse public signals in *exact* circuit order
             solana_verifier::verify_transfer(&proof_bytes, &public_inputs_bytes)
                 .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
-            let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
-                .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
-
-            let out1_commitment     = sigs[transfer_idx::OUT_COMMITMENT_1];
-            let out2_commitment     = sigs[transfer_idx::OUT_COMMITMENT_2];
-            let nf_from_snark       = sigs[transfer_idx::NULLIFIER];
-            let merkle_root_before  = sigs[transfer_idx::MERKLE_ROOT];
-            let new_root1           = sigs[transfer_idx::NEW_MERKLE_ROOT_1];
-            let new_root2           = sigs[transfer_idx::NEW_MERKLE_ROOT_2];
-            let new_next_leaf_index = sigs[transfer_idx::NEW_NEXT_LEAF_INDEX];
-            let enc1                = sigs[transfer_idx::ENC_NOTE1_HASH];
-            let enc2                = sigs[transfer_idx::ENC_NOTE2_HASH];
-
-            // 1) Nullifier must match argument and be unused
-            require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
-            let rec = &mut ctx.accounts.nullifier_record;
-            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
-            rec.used = true;
-            rec.bump = ctx.bumps.nullifier_record;
-
-            // 2) STRICT sync check: spent root must equal on-chain current root
-            let tree = &mut ctx.accounts.tree;
-            require!(
-                merkle_root_before == tree.current_root,
-                CipherPayError::OldRootMismatch
-            );
-
-            // 3) Index transition check: new_next = old_next + 2 (and within depth)
-            let old_next = tree.next_index;
-            let new_next = fe32_to_u32_le(new_next_leaf_index);
-            let max_leaves: u64 = 1u64 << (tree.depth as u32);
-            require!((new_next as u64) <= max_leaves, CipherPayError::InvalidInput);
-            require!(
-                new_next == old_next.checked_add(2).ok_or_else(|| error!(CipherPayError::ArithmeticError))?,
-                CipherPayError::NextLeafIndexMismatch
-            );
-
-            // 4) Advance the tree state atomically
-            tree.current_root = new_root2;
-            tree.next_index   = new_next;
-
-            // 5) Add the two new roots to the cache (useful for withdraw)
-            insert_many_roots(&[new_root1, new_root2], &mut ctx.accounts.root_cache);
-
-            // 6) Emit event
-            emit!(TransferCompleted {
-                nullifier,
-                out1_commitment,
-                out2_commitment,
-                enc_note1_hash: enc1,
-                enc_note2_hash: enc2,
-                merkle_root_before,
-                new_merkle_root1: new_root1,
-                new_merkle_root2: new_root2,
-                next_leaf_index: new_next,
-                mint: Pubkey::default(),
-            });
         }
-
-        #[cfg(not(feature = "real-crypto"))]
-        {
-            let rec = &mut ctx.accounts.nullifier_record;
-            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
-            rec.used = true;
-            rec.bump = ctx.bumps.nullifier_record;
-
-            emit!(TransferCompleted {
-                nullifier,
-                out1_commitment: [0u8; 32],
-                out2_commitment: [0u8; 32],
-                enc_note1_hash: [0u8; 32],
-                enc_note2_hash: [0u8; 32],
-                merkle_root_before: [0u8; 32],
-                new_merkle_root1: [0u8; 32],
-                new_merkle_root2: [0u8; 32],
-                next_leaf_index: 0,
-                mint: Pubkey::default(),
-            });
-        }
-
+        let sigs = parse_transfer_publics(&public_inputs_bytes)?;
+        let nf               = sigs[transfer_idx::NULLIFIER];
+        let out1_commitment  = sigs[transfer_idx::OUT_COMMITMENT_1];
+        let out2_commitment  = sigs[transfer_idx::OUT_COMMITMENT_2];
+        let enc_note1_hash   = sigs[transfer_idx::ENC_NOTE1_HASH];
+        let enc_note2_hash   = sigs[transfer_idx::ENC_NOTE2_HASH];
+        let old_root         = sigs[transfer_idx::MERKLE_ROOT];
+        let new_root1        = sigs[transfer_idx::NEW_MERKLE_ROOT_1];
+        let new_root2        = sigs[transfer_idx::NEW_MERKLE_ROOT_2];
+        let next_leaf_index  = sigs[transfer_idx::NEW_NEXT_LEAF_INDEX];
+    
+        // ensure nullifier in proof == instruction arg
+        require!(nf == nf32, CipherPayError::InvalidZkProof);
+    
+        // --- strict sync with on-chain tree history ---
+        let tree = &mut ctx.accounts.tree;
+        require!(old_root == tree.current_root, CipherPayError::OldRootMismatch);
+    
+        // transfer inserts two leaves → next_index must jump by 2
+        let sig_next: u32 = u32_le(&next_leaf_index);
+        require!(sig_next == tree.next_index.saturating_add(2), CipherPayError::InvalidInput);
+    
+        // --- commit state: advance to the *final* new root ---
+        tree.current_root = new_root2;
+        tree.next_index   = sig_next;
+    
+        // --- cache both intermediate roots (zero-copy) ---
+        insert_many_roots(&[new_root1, new_root2], &mut ctx.accounts.root_cache);
+    
+        emit!(TransferCompleted {
+            nullifier: nf32,
+            out1_commitment,
+            out2_commitment,
+            enc_note1_hash,
+            enc_note2_hash,
+            merkle_root_before: old_root,
+            new_merkle_root1: new_root1,
+            new_merkle_root2: new_root2,
+            next_leaf_index: sig_next,
+            mint: Pubkey::default(),
+        });
+    
         Ok(())
     }
 
@@ -323,8 +305,8 @@ pub mod cipherpay_anchor {
             require!(nf_from_snark == nullifier, CipherPayError::NullifierMismatch);
 
             let rec = &mut ctx.accounts.nullifier_record;
-            require!(!rec.used, CipherPayError::NullifierAlreadyUsed);
-            rec.used = true;
+            require!(!rec.processed, CipherPayError::NullifierAlreadyUsed);
+            rec.processed = true;
             rec.bump = ctx.bumps.nullifier_record;
 
             require!(is_valid_root(&merkle_root, &ctx.accounts.root_cache), CipherPayError::UnknownMerkleRoot);
