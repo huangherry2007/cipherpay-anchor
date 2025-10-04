@@ -55,29 +55,6 @@ pub struct InitializeRootCache<'info> {
     pub system_program: Program<'info, System>,
 }
 
-
-/// (Optional/no-op in your model) SPL token deposit helper
-#[derive(Accounts)]
-#[instruction(_deposit_hash: [u8;32])]
-pub struct DepositTokens<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-
-    #[account(mut)]
-    pub vault: SystemAccount<'info>,
-
-    /// CHECK: mint not inspected in tests
-    pub token_mint: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub user_token_account: Account<'info, TokenAccount>,
-
-    #[account(mut)]
-    pub vault_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
 #[derive(Accounts)]
 #[instruction(deposit_hash: Vec<u8>, proof_bytes: Vec<u8>, public_inputs_bytes: Vec<u8>)]
 pub struct ShieldedDepositAtomic<'info> {

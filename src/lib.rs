@@ -111,11 +111,6 @@ pub mod cipherpay_anchor {
         Ok(())
     }
 
-    /// Optional SPL hook (no-op in your current design)
-    pub fn deposit_tokens(_ctx: Context<DepositTokens>, _deposit_hash: Vec<u8>) -> Result<()> {
-        Ok(())
-    }
-
     /// Atomic deposit: Memo(deposit_hash) + SPL TransferChecked to vault ATA in the *same* tx,
     /// then accept zk-proof and roll the Merkle root forward.
     pub fn shielded_deposit_atomic(
