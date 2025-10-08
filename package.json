@@ -7,9 +7,9 @@
     "build": "anchor build -- --features real-crypto",
     "deploy": "anchor deploy",
     "test": "anchor test",
-    "test:deposit": "jest tests/deposit.ts",
-    "test:transfer": "jest tests/transfer.ts",
-    "test:withdraw": "jest tests/withdraw.ts"
+    "test:deposit": "jest tests/deposit.ts --runInBand",
+    "test:transfer": "jest tests/transfer.ts --runInBand",
+    "test:withdraw": "jest tests/withdraw.ts --runInBand"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",

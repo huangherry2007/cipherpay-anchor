@@ -288,7 +288,9 @@ export CP_GENESIS_ROOT=0x2a7c7c9b6ce5880b9f6f228d72bf6a575a526f29c66ecceef8b753d
 ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 \
 ANCHOR_WALLET=~/.config/solana/id.json \
 anchor run init
-step 5:
-npm run test:deposit
+step 5: 
+### deposit/deposit1/deposit2/deposit3
+DEPOSIT_VARIANT=deposit npm run test:deposit
+
 npm run test:transfer
 npm run test:withdraw

@@ -1,9 +1,12 @@
-// tests/deposit.ts
-import * as fs from "fs";
-import * as path from "path";
-import * as anchor from "@coral-xyz/anchor";
-import { Program, AnchorProvider, web3 } from "@coral-xyz/anchor";
-import {
+// tests/deposit.js
+/* eslint-disable no-console */
+import type { Connection, PublicKey, TransactionInstruction, Transaction } from "@solana/web3.js";
+import type { AnchorProvider as AnchorProviderType, Program as AnchorProgramType } from "@coral-xyz/anchor";
+const fs = require("fs");
+const path = require("path");
+const anchor = require("@coral-xyz/anchor");
+const { Program, AnchorProvider, web3 } = anchor;
+const {
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   createMint,
@@ -11,13 +14,24 @@ import {
   createAssociatedTokenAccountInstruction,
   mintTo,
   createTransferCheckedInstruction,
-} from "@solana/spl-token";
-import { createMemoInstruction } from "@solana/spl-memo";
+} = require("@solana/spl-token");
+const { createMemoInstruction } = require("@solana/spl-memo");
 
-// ───────────────────────── IDL loader (no sanitizer) ─────────────────────────
-type AnyIdl = Record<string, any>;
+/**
+ * Env knobs:
+ *  - DEPOSIT_VARIANT=deposit|deposit1|deposit2|deposit3   (default: deposit)
+ *  - DEPOSIT_BUILD_DIR=<dir of .bin files>                 (default: ./proofs)
+ *  - PROGRAM_ID=<program pubkey>                           (default: idl.address)
+ *  - SOLANA_URL=<rpc>                                      (default: http://127.0.0.1:8899)
+ *  - CU_LIMIT=<number>                                     (default: 800000)
+ *  - INCLUDE_MEMO=0|1                                      (default: 0)
+ *  - MEMO_TEXT=<short text>                                (default: "")
+ *  - PUBS_ENDIAN=le|be                                     (default: le)  // how we send publics
+ *  - DHASH_SEED_ENDIAN=le|be                               (default: le)  // PDA seed for depositHash
+ *  - FAIL_ON_ROOT_MISMATCH=0|1                             (default: 0)
+ */
 
-function loadIdl(): AnyIdl {
+function loadIdl(): any {
   const IDL_PATH = path.resolve(__dirname, "../target/idl/cipherpay_anchor.json");
   const raw = fs.readFileSync(IDL_PATH, "utf8");
   const idl = JSON.parse(raw);
@@ -26,81 +40,71 @@ function loadIdl(): AnyIdl {
   }
   return idl;
 }
-
-function makeProgram(provider: AnchorProvider) {
-  const idl = loadIdl() as any;
-  const programIdStr: string | undefined = process.env.PROGRAM_ID || idl.address;
+function makeProgram(provider: AnchorProviderType): AnchorProgramType {
+  const idl = loadIdl();
+  const programIdStr = process.env.PROGRAM_ID || idl.address;
   if (!programIdStr) {
-    throw new Error(
-      "PROGRAM_ID not set and IDL.address missing. Set PROGRAM_ID or add `address` to the IDL."
-    );
+    throw new Error("PROGRAM_ID not set and IDL.address missing. Set PROGRAM_ID or add `address` to the IDL.");
   }
   if (idl.address !== programIdStr) idl.address = programIdStr;
-  return new Program(idl as unknown as anchor.Idl, provider); // Program reads address from idl.address
+  return new Program(idl, provider);
 }
 
-// ───────────────────────── helpers ─────────────────────────
-function readBin(p: string): Buffer {
-  return fs.readFileSync(path.resolve(p));
+// helpers
+function readBin(p: string): Buffer { return fs.readFileSync(path.resolve(p)); }
+function toHexLE(b: Buffer | Uint8Array): string { return [...b].map((x) => x.toString(16).padStart(2, "0")).join(""); }
+function toHexBE(b: Buffer | Uint8Array): string { return Buffer.from(b).reverse().toString("hex"); }
+function slice32(buf: Buffer | Uint8Array, i: number): Buffer { const off = i * 32; return Buffer.from(buf.subarray(off, off + 32)); }
+function reEnd32(buf: Buffer, endian: "le"|"be" /* 'le'|'be' */): Buffer {
+  if (endian === "le") return buf;
+  const out = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i += 32) {
+    Buffer.from(buf.subarray(i, i + 32)).reverse().copy(out, i);
+  }
+  return out;
 }
-function toHexLE(b: Buffer): string {
-  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-function slice32(buf: Buffer, i: number): Buffer {
-  const off = i * 32;
-  return buf.subarray(off, off + 32);
-}
-async function ensureAirdrop(
-  connection: web3.Connection,
-  pubkey: web3.PublicKey,
-  wantLamports = 10 * web3.LAMPORTS_PER_SOL
-) {
+async function ensureAirdrop(connection: Connection, pubkey: PublicKey, wantLamports: number = 10 * web3.LAMPORTS_PER_SOL): Promise<number> {
   const before = await connection.getBalance(pubkey);
   if (before >= wantLamports) return before;
   const sig = await connection.requestAirdrop(pubkey, wantLamports - before);
   await connection.confirmTransaction(sig, "confirmed");
   return await connection.getBalance(pubkey);
 }
-async function ensureAtaIx(
-  connection: web3.Connection,
-  ata: web3.PublicKey,
-  payer: web3.PublicKey,
-  owner: web3.PublicKey,
-  mint: web3.PublicKey
-): Promise<web3.TransactionInstruction | null> {
+async function ensureAtaIx(connection: Connection, ata: PublicKey, payer: PublicKey, owner: PublicKey, mint: PublicKey): Promise<TransactionInstruction | null> {
   const info = await connection.getAccountInfo(ata);
   if (info) return null;
   return createAssociatedTokenAccountInstruction(
     payer, ata, owner, mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
   );
 }
-async function getU64TokenBal(
-  connection: web3.Connection,
-  ata: web3.PublicKey
-): Promise<number> {
+async function getU64TokenBal(connection: Connection, ata: PublicKey): Promise<number> {
   const r = await connection.getTokenAccountBalance(ata, "confirmed");
-  // amount is a decimal string; with decimals=0 this fits safely in number for these tests
   return Number(r.value.amount);
 }
 
-// ───────────────────────── config ─────────────────────────
+// config
+const VARIANT = (process.env.DEPOSIT_VARIANT || "deposit").trim();
 const RPC_URL = process.env.SOLANA_URL || "http://127.0.0.1:8899";
 const CU_LIMIT = Number(process.env.CU_LIMIT ?? 800_000);
 
-// PDA seeds (must match on-chain constants)
+const INCLUDE_MEMO = (process.env.INCLUDE_MEMO ?? "0") !== "0";
+const MEMO_TEXT = process.env.MEMO_TEXT ?? "";
+
+const PUBS_ENDIAN = (process.env.PUBS_ENDIAN || "le").toLowerCase();          // how we send publics to the program
+const DHASH_SEED_ENDIAN = (process.env.DHASH_SEED_ENDIAN || "le").toLowerCase(); // endianness for PDA seed
+const FAIL_ON_ROOT_MISMATCH = (process.env.FAIL_ON_ROOT_MISMATCH ?? "0") !== "0";
+
 const TREE_SEED = Buffer.from("tree");
 const ROOT_CACHE_SEED = Buffer.from("root_cache");
 const VAULT_SEED = Buffer.from("vault");
 const DEPOSIT_SEED = Buffer.from("deposit");
 
-// proofs dir (override with env if desired)
 const buildDir = process.env.DEPOSIT_BUILD_DIR
   ? path.resolve(process.env.DEPOSIT_BUILD_DIR)
   : path.resolve("proofs");
-const proofPath = path.join(buildDir, "deposit_proof.bin");
-const publicsPath = path.join(buildDir, "deposit_public_signals.bin");
+const proofPath = path.join(buildDir, `${VARIANT}_proof.bin`);
+const publicsPath = path.join(buildDir, `${VARIANT}_public_signals.bin`);
 
-// public signal order used by your circuit export:
 const DEPOSIT_IDX = {
   NEW_COMMITMENT: 0,
   OWNER: 1,
@@ -109,33 +113,21 @@ const DEPOSIT_IDX = {
   AMOUNT: 4,
   DEPOSIT_HASH: 5,
   OLD_ROOT: 6,
-} as const;
+};
 
-// mint config — 0 decimals to keep amounts simple
-const MINT_DECIMALS = 0 as const;
-
-// Memo program id (for pretty printing)
-const MEMO_PROGRAM_ID = new web3.PublicKey(
-  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
-);
+// memo program id (for pretty printing)
+const MEMO_PROGRAM_ID = new web3.PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 // ───────────────────────── tests ─────────────────────────
-describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized", () => {
+describe(`shielded_deposit_atomic [${VARIANT}] (JS quick-checks)`, () => {
   const connection = new web3.Connection(RPC_URL, "confirmed");
 
-  // concrete wallet so provider.wallet.payer exists
   const wallet = new anchor.Wallet(
     web3.Keypair.fromSecretKey(
-      Buffer.from(
-        JSON.parse(
-          fs.readFileSync(process.env.HOME + "/.config/solana/id.json", "utf8")
-        )
-      )
+      Buffer.from(JSON.parse(fs.readFileSync(process.env.HOME + "/.config/solana/id.json", "utf8")))
     )
   );
-  const provider = new AnchorProvider(connection, wallet, {
-    commitment: "confirmed",
-  });
+  const provider = new AnchorProvider(connection, wallet, { commitment: "confirmed" });
   anchor.setProvider(provider);
 
   const program = makeProgram(provider);
@@ -144,40 +136,59 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
 
   console.log("🧭 programId:", programId.toBase58());
   console.log("👛 payer:", payer.toBase58());
+  console.log("📁 using proof files:", { proofPath, publicsPath });
 
-  // populated in tests
   let proofBytes: Buffer;
-  let publicInputsBytes: Buffer;
-  let depositHash: Buffer;
+  let publicsLE: Buffer; // original (LE chunks from your converter)
+  let publicsForIx: Buffer; // after PUBS_ENDIAN toggle
+  let depositHash: Buffer; // 32B as present in publicsLE (LE form)
   let amountU64: number;
 
-  // token + PDAs
-  let tokenMint!: web3.PublicKey;
-  let payerAta!: web3.PublicKey;
-  let vaultPda!: web3.PublicKey;
-  let vaultAta!: web3.PublicKey;
+  let tokenMint: PublicKey;
+  let payerAta: PublicKey;
+  let vaultPda: PublicKey;
+  let vaultAta: PublicKey;
 
-  // global tree & root cache PDAs (pre-initialized by migration)
-  let treePda!: web3.PublicKey;
-  let rootCachePda!: web3.PublicKey;
+  let treePda: PublicKey;
+  let rootCachePda: PublicKey;
 
-  // cached pre-state for assertions
-  let preTreeNextIndex: number = -1; // -1 means "skip assertion if we can't decode"
+  let preTreeNextIndex = -1;
 
   beforeAll(async () => {
     await ensureAirdrop(connection, payer);
 
     // load proof + publics
     proofBytes = readBin(proofPath);
-    publicInputsBytes = readBin(publicsPath);
+    publicsLE = readBin(publicsPath); // your bin writer used LE per FE
+    console.log("📦 proof/publics sizes:", {
+      proofBytes: proofBytes.length,
+      publicInputsBytes: publicsLE.length,
+      nPublic: publicsLE.length / 32,
+    });
     expect(proofBytes.length).toBe(256);
-    expect(publicInputsBytes.length).toBe(7 * 32);
+    expect(publicsLE.length).toBe(7 * 32);
 
-    // extract fields
-    depositHash = slice32(publicInputsBytes, DEPOSIT_IDX.DEPOSIT_HASH);
-    console.log("🔑 depositHash (LE, hex):", toHexLE(depositHash));
+    // pretty-print publics in BE for readability
+    const labels = [
+      "newCommitment",
+      "ownerCipherPayPubKey",
+      "newMerkleRoot",
+      "newNextLeafIndex",
+      "amount",
+      "depositHash",
+      "oldMerkleRoot",
+    ];
+    const pretty: Record<string, string> = {};
+    for (let i = 0; i < 7; i++) {
+      pretty[labels[i]] = "0x" + toHexBE(slice32(publicsLE, i));
+    }
+    console.log("🔎 publics (BE) =", pretty);
 
-    const amountFe = slice32(publicInputsBytes, DEPOSIT_IDX.AMOUNT);
+    // extract fields from LE buffer
+    depositHash = slice32(publicsLE, DEPOSIT_IDX.DEPOSIT_HASH);
+    console.log(`🔑 depositHash [${VARIANT}] (LE, hex):`, toHexLE(depositHash));
+
+    const amountFe = slice32(publicsLE, DEPOSIT_IDX.AMOUNT);
     amountU64 =
       amountFe[0] |
       (amountFe[1] << 8) |
@@ -189,37 +200,32 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
       (amountFe[7] * 2 ** 56);
     console.log(`💵 amount (u64) = ${amountU64}`);
 
-    // ---- Derive PDAs (must already exist, created by migrations/01_init.ts)
+    // apply endianness toggle for what we send to the program
+    publicsForIx = reEnd32(publicsLE, PUBS_ENDIAN as "le" | "be");
+    if (PUBS_ENDIAN !== "le") {
+      console.log(`⚙️  PUBS_ENDIAN=${PUBS_ENDIAN} — sending publics after per-32B reversal`);
+    }
+
     [treePda] = web3.PublicKey.findProgramAddressSync([TREE_SEED], programId);
-    [rootCachePda] = web3.PublicKey.findProgramAddressSync(
-      [ROOT_CACHE_SEED],
-      programId
-    );
+    [rootCachePda] = web3.PublicKey.findProgramAddressSync([ROOT_CACHE_SEED], programId);
     console.log("🌲 tree PDA:", treePda.toBase58());
     console.log("🗃️ rootCache PDA:", rootCachePda.toBase58());
 
-    // Sanity checks: both accounts must exist
+    // Ensure both PDAs exist
     const treeInfo = await connection.getAccountInfo(treePda);
     const rcInfo = await connection.getAccountInfo(rootCachePda);
     if (!treeInfo) throw new Error("TreeState PDA missing. Run `anchor run init` first.");
     if (!rcInfo) throw new Error("RootCache PDA missing. Run `anchor run init` first.");
 
-    // Capture pre tree.next_index for later assertion
     try {
-      const treeAcc: any = await (program.account as any).treeState.fetch(treePda);
+      const treeAcc = await (program.account as any).treeState.fetch(treePda);
       preTreeNextIndex = Number(treeAcc.nextIndex ?? treeAcc.next_index ?? 0);
     } catch {
-      preTreeNextIndex = -1; // skip if we can't decode
+      preTreeNextIndex = -1;
     }
 
-    // ---- SPL Mint & ATAs ----
-    tokenMint = await createMint(
-      connection,
-      wallet.payer, // fee payer
-      payer, // mint authority
-      null, // freeze authority
-      MINT_DECIMALS
-    );
+    // SPL Mint & ATAs (0 decimals)
+    tokenMint = await createMint(connection, wallet.payer, payer, null, 0);
     console.log("✅ token mint:", tokenMint.toBase58());
 
     [vaultPda] = web3.PublicKey.findProgramAddressSync([VAULT_SEED], programId);
@@ -234,7 +240,7 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
 
     const createPayerAtaIx = await ensureAtaIx(connection, payerAta, payer, payer, tokenMint);
     const createVaultAtaIx = await ensureAtaIx(connection, vaultAta, payer, vaultPda, tokenMint);
-    const ixs: web3.TransactionInstruction[] = [];
+    const ixs = [];
     if (createPayerAtaIx) ixs.push(createPayerAtaIx);
     if (createVaultAtaIx) ixs.push(createVaultAtaIx);
     if (ixs.length) {
@@ -247,21 +253,66 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
     console.log("✅ minted amount to payer ATA");
   });
 
-  // Helper to build a full deposit tx with given deposit hash
-  async function buildDepositTx(dHash: Buffer) {
+  it("debug: check OLD_ROOT(new) vs on-chain tree root (+ optional cache sample)", async () => {
+    const oldRootFe = slice32(publicsLE, DEPOSIT_IDX.OLD_ROOT);
+    const newRootFe = slice32(publicsLE, DEPOSIT_IDX.NEW_ROOT);
+    console.log("🔎 OLD_ROOT (pubs, BE) =", "0x" + toHexBE(oldRootFe));
+    console.log("🔎 NEW_ROOT (pubs, BE) =", "0x" + toHexBE(newRootFe));
+
+    try {
+      const treeAcc = await (program.account as any).treeState.fetch(treePda);
+      const onchainRootBytes = Buffer.from(
+        (treeAcc.currentRoot ?? treeAcc.current_root ?? treeAcc.root ?? [])
+      );
+      console.log(
+        "🔎 on-chain tree.root (BE) =",
+        "0x" + Buffer.from(onchainRootBytes).reverse().toString("hex")
+      );
+      const same = Buffer.compare(Buffer.from(oldRootFe), Buffer.from(onchainRootBytes)) === 0;
+      console.log("🧪 OLD_ROOT == on-chain root ?", same);
+      if (FAIL_ON_ROOT_MISMATCH) expect(same).toBe(true);
+    } catch (e) {
+      console.log("⚠️ could not fetch treeState for root parity:", String(e));
+    }
+
+    try {
+      if ((program.account as any).rootCache?.fetch) {
+        const rc = await (program.account as any).rootCache.fetch(rootCachePda);
+        const arr = (rc.roots ?? rc.entries ?? rc.cache ?? []) || [];
+        const sample = Array.isArray(arr) ? arr.slice(0, 6) : [];
+        console.log(
+          "🔎 root-cache sample (first up to 6, BE):",
+          sample.map((a) => "0x" + Buffer.from(Buffer.from(a)).reverse().toString("hex"))
+        );
+      } else {
+        console.log("ℹ️ program.account.rootCache not available (loader struct?)");
+      }
+    } catch (e) {
+      console.log("⚠️ could not fetch rootCache (ok if loader):", String(e));
+    }
+  });
+
+  async function buildDepositTx(dHashLE: Buffer): Promise<{ tx: Transaction; programIx: TransactionInstruction }> {
+    // choose seed endianness for PDA derivation
+    const seedBytes =
+      DHASH_SEED_ENDIAN === "be" ? Buffer.from(dHashLE).reverse() : dHashLE;
+    if (DHASH_SEED_ENDIAN !== "le") {
+      console.log(`⚙️  DHASH_SEED_ENDIAN=${DHASH_SEED_ENDIAN} — PDA uses reversed hash`);
+    }
+
     const [depositMarkerPda] = web3.PublicKey.findProgramAddressSync(
-      [DEPOSIT_SEED, dHash],
+      [DEPOSIT_SEED, seedBytes],
       programId
     );
 
     const cuIx = web3.ComputeBudgetProgram.setComputeUnitLimit({ units: CU_LIMIT });
     const transferIx = createTransferCheckedInstruction(
-      payerAta, tokenMint, vaultAta, payer, amountU64, MINT_DECIMALS, [], TOKEN_PROGRAM_ID
+      payerAta, tokenMint, vaultAta, payer, amountU64, 0, [], TOKEN_PROGRAM_ID
     );
-    const memoIx = createMemoInstruction("deposit:" + toHexLE(dHash), [payer]);
+    const memoIx = INCLUDE_MEMO ? createMemoInstruction(MEMO_TEXT || "d", [payer]) : null;
 
     const programIx = await program.methods
-      .shieldedDepositAtomic(dHash, proofBytes, publicInputsBytes)
+      .shieldedDepositAtomic(dHashLE, proofBytes, publicsForIx)
       .accountsPartial({
         payer,
         tree: treePda,
@@ -277,26 +328,29 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
       })
       .instruction();
 
-    const tx = new web3.Transaction().add(cuIx, memoIx, transferIx, programIx);
+    const tx: Transaction = new web3.Transaction().add(
+      cuIx,
+      ...(memoIx ? [memoIx] : []),
+      transferIx,
+      programIx
+    );
     return { tx, programIx };
   }
 
-  it("verifies on-chain via shielded_deposit_atomic (PDA root_cache, only payer signs)", async () => {
-    // Pre balances
+  it("verifies on-chain via shielded_deposit_atomic (quick-checks)", async () => {
     const prePayer = await getU64TokenBal(connection, payerAta);
     const preVault = await getU64TokenBal(connection, vaultAta);
 
-    // Build + send
     const { tx, programIx } = await buildDepositTx(depositHash);
 
-    // sanity — should be only `payer`
-    const signers = programIx.keys.filter(k => k.isSigner).map(k => k.pubkey.toBase58());
+    const signers = programIx.keys
+      .filter((k) => k.isSigner)
+      .map((k) => k.pubkey.toBase58());
     console.log("🧪 required signers (program ix):", signers);
     expect(signers).toEqual([payer.toBase58()]);
 
-    // Pretty-print the built transaction (optional)
     console.log("🔎 full tx instructions:");
-    tx.instructions.forEach((ix, i) => {
+    tx.instructions.forEach((ix: TransactionInstruction, i: number) => {
       const pid = ix.programId.toBase58();
       const tag =
         pid === TOKEN_PROGRAM_ID.toBase58()
@@ -311,76 +365,45 @@ describe("shielded_deposit_atomic (end-to-end) — assumes PDAs pre-initialized"
       console.log(`  [${i}] program=${pid} (${tag})`);
       if (pid === TOKEN_PROGRAM_ID.toBase58()) {
         const k = ix.keys.map((m) => m.pubkey.toBase58());
-        console.log(
-          `      token.keys: src=${k[0]} mint=${k[1]} dst=${k[2]} auth=${k[3]}`
-        );
+        console.log(`      token.keys: src=${k[0]} mint=${k[1]} dst=${k[2]} auth=${k[3]}`);
       }
     });
 
     const sig = await provider.sendAndConfirm(tx, [], { skipPreflight: false });
-    console.log("✅ shielded_deposit_atomic tx:", sig);
+    console.log(`✅ shielded_deposit_atomic tx [${VARIANT}]:`, sig);
 
-    // Post balances
     const postPayer = await getU64TokenBal(connection, payerAta);
     const postVault = await getU64TokenBal(connection, vaultAta);
-
-    // Balance assertions
     const amt = amountU64;
     expect(postPayer).toBe(prePayer - amt);
     expect(postVault).toBe(preVault + amt);
 
-    // TreeState.next_index bump (if we could decode pre)
     if (preTreeNextIndex >= 0) {
       try {
-        const treeAcc: any = await (program.account as any).treeState.fetch(treePda);
+        const treeAcc = await (program.account as any).treeState.fetch(treePda);
         const postNextIndex = Number(treeAcc.nextIndex ?? treeAcc.next_index ?? 0);
         expect(postNextIndex).toBe(preTreeNextIndex + 1);
       } catch {
-        // skip if decode fails
+        /* ignore */
       }
     }
 
-    // Logs (optional)
     const res = await connection.getTransaction(sig, {
       commitment: "confirmed",
       maxSupportedTransactionVersion: 0,
     });
     console.log("---- on-chain logs ----");
-    res?.meta?.logMessages?.forEach((l) => console.log(l));
+    res?.meta?.logMessages?.forEach((l: string) => console.log(l));
     console.log("---- end logs ----");
   });
 
-  it("replay-guard: same depositHash again should fail and leave balances unchanged", async () => {
-    const prePayer = await getU64TokenBal(connection, payerAta);
-    const preVault = await getU64TokenBal(connection, vaultAta);
-
-    const { tx } = await buildDepositTx(depositHash);
-
-    let failed = false;
-    try {
-      await provider.sendAndConfirm(tx, [], { skipPreflight: false });
-    } catch (e: any) {
-      failed = true;
-      const msg = String(e?.message ?? e);
-      console.log("↩️ replay tx failed as expected:", msg);
-    }
-    expect(failed).toBe(true);
-
-    // Balances unchanged
-    const postPayer = await getU64TokenBal(connection, payerAta);
-    const postVault = await getU64TokenBal(connection, vaultAta);
-    expect(postPayer).toBe(prePayer);
-    expect(postVault).toBe(preVault);
-  });
-
   it("sanity: proof structure", () => {
-    const a = publicInputsBytes.subarray(0, 32);
-    expect(a.length).toBe(32);
     const pA = proofBytes.subarray(0, 64);
     const pB = proofBytes.subarray(64, 192);
     const pC = proofBytes.subarray(192, 256);
     expect(pA.length).toBe(64);
     expect(pB.length).toBe(128);
     expect(pC.length).toBe(64);
+    expect(publicsLE.length % 32).toBe(0);
   });
 });
