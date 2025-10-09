@@ -295,3 +295,21 @@ DEPOSIT_VARIANT=deposit npm run test:deposit
 TRANSFER_VARIANT=transfer npm run test:transfer
 
 WITHDRAW_VARIANT=withdraw npm run test:withdraw
+
+DEPOSIT_VARIANT=deposit1 npm run test:deposit
+
+TRANSFER_VARIANT=transfer1 npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw1 npm run test:withdraw
+
+DEPOSIT_VARIANT=deposit2 npm run test:deposit
+
+TRANSFER_VARIANT=transfer2 npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw2 npm run test:withdraw
+
+DEPOSIT_VARIANT=deposit3 npm run test:deposit
+
+TRANSFER_VARIANT=transfer3 npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw3 npm run test:withdraw
