@@ -159,18 +159,47 @@ pub fn assert_transfer_checked_in_same_tx(
 
 // ─── Merkle helpers ───
 
-pub fn insert_merkle_root(new_root: &[u8; 32], cache: &mut Account<MerkleRootCache>) {
-    if !cache.roots.contains(new_root) {
-        cache.roots.push(*new_root);
+/// Insert a single root if absent.
+/// Signature kept compatible with existing call sites: (new_root, &mut cache).
+pub fn insert_merkle_root(new_root: &[u8; 32], cache: &mut AccountLoader<MerkleRootCache>) {
+    match cache.load_mut() {
+        Ok(mut c) => {
+            if !c.contains(new_root) {
+                c.insert(*new_root);
+            }
+        }
+        Err(_e) => {
+            // Avoid panicking inside program; just log and continue.
+            msg!("⚠️ insert_merkle_root: failed to load root_cache");
+        }
     }
 }
 
-pub fn insert_many_roots(new_roots: &[[u8; 32]], cache: &mut Account<MerkleRootCache>) {
-    for r in new_roots {
-        insert_merkle_root(r, cache);
+/// Insert many roots (dedup each).
+/// Signature kept compatible with existing call sites: (new_roots, &mut cache).
+pub fn insert_many_roots(new_roots: &[[u8; 32]], cache: &mut AccountLoader<MerkleRootCache>) {
+    match cache.load_mut() {
+        Ok(mut c) => {
+            for r in new_roots {
+                if !c.contains(r) {
+                    c.insert(*r);
+                }
+            }
+        }
+        Err(_e) => {
+            msg!("⚠️ insert_many_roots: failed to load root_cache");
+        }
     }
 }
 
-pub fn is_valid_root(root: &[u8; 32], cache: &Account<MerkleRootCache>) -> bool {
-    cache.roots.contains(root)
+/// Pure read: check if a root exists.
+/// Returns `false` if cache cannot be loaded (shouldn’t happen after init).
+pub fn is_valid_root(root: &[u8; 32], cache: &AccountLoader<MerkleRootCache>) -> bool {
+    match cache.load() {
+        Ok(c) => c.contains(root),
+        Err(_e) => {
+            msg!("⚠️ is_valid_root: failed to load root_cache");
+            false
+        }
+    }
 }

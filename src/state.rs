@@ -25,21 +25,13 @@ impl DepositMarker {
 
 /// Optional on-chain nullifier record (if you decide to persist spent notes).
 #[account]
-pub struct Nullifier {
-    /// Whether this nullifier has been seen/used
+pub struct NullifierRecord {
     pub used: bool,
-    /// PDA bump
     pub bump: u8,
 }
-
-impl Nullifier {
+impl NullifierRecord {
     pub const SIZE: usize = 1 + 1;
     pub const SPACE: usize = 8 + Self::SIZE;
-
-    #[inline]
-    pub fn mark_used(&mut self) {
-        self.used = true;
-    }
 }
 
 #[account]
@@ -55,63 +47,84 @@ impl anchor_lang::Space for TreeState {
     const INIT_SPACE: usize = 2 + 32 + 4 + 1 + 31;
 }
 
-/// Ring-buffer-ish cache of recent Merkle roots (simple Vec variant).
+/// Fixed-capacity ring buffer for recent Merkle roots.
 ///
-/// Layout: Anchor serializes `Vec<[u8;32]>` as `4 (len) + len * 32` bytes.
-/// We allocate enough space for `MAX_ROOTS` entries; at runtime we keep length
-/// ≤ MAX_ROOTS and drop the oldest when full.
-#[account]
+/// • Zero-copy: no (de)serialization of a large Vec on every ix.
+/// • Backed by a PDA and accessed via `AccountLoader<MerkleRootCache>`.
+///
+/// Layout on-chain:
+///   [8-byte discriminator] + [[u8;32]; MAX_ROOTS] + u16(next_slot) + u16(count)
+#[account(zero_copy)]
+#[repr(C)]
 pub struct MerkleRootCache {
-    /// Recent roots (most recent is at the end).
-    pub roots: Vec<[u8; 32]>,
+    /// Ring buffer of recent roots.
+    pub roots: [[u8; 32]; MAX_ROOTS],
+    /// Next write position in the ring (0..MAX_ROOTS-1).
+    pub next_slot: u16,
+    /// Number of valid entries (<= MAX_ROOTS).
+    pub count: u16,
 }
 
 impl MerkleRootCache {
-    /// Raw field size (excluding discriminator). We reserve space for up to MAX_ROOTS elements.
-    /// 4 bytes for Vec length + N * 32 bytes per root.
-    pub const SIZE: usize = 4 + (MAX_ROOTS * 32);
-    /// Full account space (including discriminator).
-    pub const SPACE: usize = 8 + Self::SIZE;
+    /// Bytes excluding the discriminator.
+    pub const BYTE_SIZE: usize = (MAX_ROOTS * 32) + 2 + 2;
+    /// Bytes including the discriminator (what you pass as `space` minus the 8 you add in `#[account(init, space = 8 + ...)]`).
+    pub const SIZE: usize = Self::BYTE_SIZE;
+    /// Convenience: full account size including discriminator.
+    pub const SPACE: usize = 8 + Self::BYTE_SIZE;
 
-    /// Insert a root if it is not already present. Returns true if inserted.
-    pub fn try_insert_root(&mut self, new_root: [u8; 32]) -> bool {
-        if self.roots.contains(&new_root) {
+    #[inline]
+    pub fn clear(&mut self) {
+        // All zeros is a valid empty state, but we explicitly reset counters.
+        self.next_slot = 0;
+        self.count = 0;
+        // Zero the roots array.
+        // (Compiler is smart enough; this does NOT copy on stack.)
+        self.roots = [[0u8; 32]; MAX_ROOTS];
+    }
+
+    /// Insert a new root (ring-buffer). Overwrites oldest when full.
+    #[inline]
+    pub fn insert(&mut self, new_root: [u8; 32]) {
+        let idx = (self.next_slot as usize) % MAX_ROOTS;
+        self.roots[idx] = new_root;
+        self.next_slot = ((self.next_slot as usize + 1) % MAX_ROOTS) as u16;
+        if (self.count as usize) < MAX_ROOTS {
+            self.count += 1;
+        }
+    }
+
+    /// Check whether a root exists in the cache (O(MAX_ROOTS)).
+    #[inline]
+    pub fn contains(&self, root: &[u8; 32]) -> bool {
+        let total = self.count as usize;
+        if total == 0 {
             return false;
         }
-        if self.roots.len() >= MAX_ROOTS {
-            // drop oldest to keep bounded size (O(n) but n=128 is tiny)
-            self.roots.remove(0);
+        // If not yet full, the logical order is 0..count-1.
+        // If full, the oldest is at next_slot.
+        let start = if total < MAX_ROOTS {
+            0usize
+        } else {
+            self.next_slot as usize
+        };
+        for i in 0..total {
+            let idx = (start + i) % MAX_ROOTS;
+            if &self.roots[idx] == root {
+                return true;
+            }
         }
-        self.roots.push(new_root);
-        true
+        false
     }
 
-    /// Insert (without duplicate check). Returns whether we dropped an old root.
-    pub fn insert_root(&mut self, new_root: [u8; 32]) -> bool {
-        let mut dropped = false;
-        if self.roots.len() >= MAX_ROOTS {
-            self.roots.remove(0);
-            dropped = true;
-        }
-        self.roots.push(new_root);
-        dropped
-    }
-
-    /// Check if a root exists in the cache.
-    #[inline]
-    pub fn contains_root(&self, root: &[u8; 32]) -> bool {
-        self.roots.contains(root)
-    }
-
-    /// Return the most recent root, if any.
+    /// Latest (most recently inserted) root, if any.
     #[inline]
     pub fn latest(&self) -> Option<[u8; 32]> {
-        self.roots.last().copied()
-    }
-
-    /// Whether the cache is at capacity.
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        self.roots.len() >= MAX_ROOTS
+        if self.count == 0 {
+            None
+        } else {
+            let idx = (self.next_slot as usize + MAX_ROOTS - 1) % MAX_ROOTS;
+            Some(self.roots[idx])
+        }
     }
 }

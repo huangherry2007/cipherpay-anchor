@@ -43,8 +43,8 @@ pub struct TransferCompleted {
 #[event]
 pub struct WithdrawCompleted {
     pub nullifier: [u8; 32],
-    pub recipient: Pubkey,
+    pub merkle_root_used: [u8; 32],
     pub amount: u64,
-    /// SPL mint that identifies the vault this came from
     pub mint: Pubkey,
+    pub recipient: Pubkey,
 }

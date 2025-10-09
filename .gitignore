@@ -29,3 +29,6 @@ Thumbs.db
 
 # anchor test
 test-ledger
+
+proofs
+*_vk.bin

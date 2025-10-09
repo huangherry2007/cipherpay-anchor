@@ -3,7 +3,7 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-cipherpay_anchor = "9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o"
+cipherpay_anchor = "56nPWpjBLbh1n8vvUdCYGmg3dS5zNwLW9UhCg4MMpBmN"
 
 [idl]
 out = "target/idl"
@@ -21,7 +21,7 @@ wallet = "~/.config/solana/id.json"
 [scripts]
 # test = "anchor test"
 # anchor run init
-init = "ts-node migrations/01_init.ts"
+init = "npx ts-node migrations/01_init.ts"
 
 [workspace]
 members = [

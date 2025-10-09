@@ -7,7 +7,7 @@ use anchor_lang::pubkey;            // brings the `pubkey!` macro into scope
 // PDA seeds (yours, kept)
 // =======================
 
-pub const PROGRAM_ADMIN: Pubkey = pubkey!("9dsJPKp8Z6TBtfbhHu1ssE8KSUMWUNUFAXy8SUxMuf9o");
+pub const PROGRAM_ADMIN: Pubkey = pubkey!("56nPWpjBLbh1n8vvUdCYGmg3dS5zNwLW9UhCg4MMpBmN");
 
 /// Deposit marker PDA: seeds = [b"deposit", deposit_hash]
 pub const DEPOSIT_MARKER_SEED: &[u8] = b"deposit";
@@ -22,12 +22,12 @@ pub const NULLIFIER_SEED: &[u8] = b"nullifier";
 
 /// Root cache PDA (ring buffer or single root, depending on your state design):
 /// seeds = [b"root_cache", mint] (or global, if you prefer)
-pub const MERKLE_ROOT_CACHE_SEED: &[u8] = b"root_cache";
+pub const ROOT_CACHE_SEED: &[u8] = b"root_cache";
 
 pub const TREE_SEED: &[u8] = b"tree";
 
 /// How many historical roots to store if you keep a ring-buffer cache.
-pub const MAX_ROOTS: usize = 128;
+pub const MAX_ROOTS: usize = 64;
 
 // ==================================
 // Groth16 / BN254 byte-size helpers
