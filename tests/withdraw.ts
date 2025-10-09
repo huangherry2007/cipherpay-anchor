@@ -50,11 +50,12 @@ const KEYPAIR_PATH =
   process.env.ANCHOR_WALLET ||
   `${process.env.HOME}/.config/solana/id.json`;
 
-const PROOF_PATH = path.resolve(__dirname, "../proofs/withdraw_proof.bin");
-const PUBSIG_PATH = path.resolve(
-  __dirname,
-  "../proofs/withdraw_public_signals.bin"
-);
+// NEW: variant selector (defaults to 'withdraw')
+const WITHDRAW_VARIANT = (process.env.WITHDRAW_VARIANT || "withdraw").trim();
+
+// File paths now depend on WITHDRAW_VARIANT (logic unchanged)
+const PROOF_PATH = path.resolve(__dirname, `../proofs/${WITHDRAW_VARIANT}_proof.bin`);
+const PUBSIG_PATH = path.resolve(__dirname, `../proofs/${WITHDRAW_VARIANT}_public_signals.bin`);
 
 // Public signals layout (5 × 32): [nullifier, merkleRoot, recipientWalletPubKey, amount, tokenId]
 const PUBSIG_COUNT = 5;
@@ -72,7 +73,6 @@ function split32(buf: Buffer, idx: number): Buffer {
   return buf.subarray(start, start + FIELD_BYTES);
 }
 function toBigIntLE(buf: Buffer): bigint {
-  // Avoid BigInt literals; works without ES2020 target
   return buf.reduceRight(
     (acc, byte) => (acc << BigInt(8)) + BigInt(byte),
     BigInt(0)
@@ -150,6 +150,7 @@ describe("Shielded Withdraw - Real Program Integration", () => {
   let withdrawAmount = 0;
 
   beforeAll(async () => {
+    console.log("📁 using proof files:", { PROOF_PATH, PUBSIG_PATH });
     await airdropIfNeeded(connection, provider.wallet.publicKey);
 
     // 1) Fresh test mint (0 decimals)
@@ -260,39 +261,34 @@ describe("Shielded Withdraw - Real Program Integration", () => {
     const preRecipient = await getAccount(provider.connection, recipientTokenAccount);
     const preAmount = Number(preRecipient.amount);
 
-        let sig: string;
+    let sig: string;
+    try {
+      sig = await (program.methods as any)
+        .shieldedWithdraw(Buffer.from(fields.nullifier), proof, publicSignals)
+        .accounts({
+          payer: provider.wallet.publicKey,
+          rootCache: rootCachePda,
+          nullifierRecord,
+          vaultPda,
+          vaultTokenAccount,
+          recipientOwner,
+          recipientTokenAccount,
+          tokenMint,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        })
+        .rpc();
+    } catch (e: any) {
+      if (e?.logs) console.error("❌ Program logs:", e.logs);
+      if (typeof e?.getLogs === "function") {
         try {
-          sig = await (program.methods as any)
-             .shieldedWithdraw(Buffer.from(fields.nullifier), proof, publicSignals)
-             .accounts({
-               payer: provider.wallet.publicKey,
-               rootCache: rootCachePda,
-               nullifierRecord,
-               vaultPda,
-               vaultTokenAccount,
-               recipientOwner,
-               recipientTokenAccount,
-               tokenMint,
-               systemProgram: SystemProgram.programId,
-               tokenProgram: TOKEN_PROGRAM_ID,
-               associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-             })
-             .rpc();
-        } catch (e: any) {
-          // Jest sometimes hides the juicy logs; print everything we can.
-          if (e?.logs) {
-            console.error("❌ Program logs:", e.logs);
-          }
-          // web3.js SendTransactionError sometimes has getLogs()
-          if (typeof e?.getLogs === "function") {
-            try {
-              const moreLogs = await e.getLogs(connection);
-              console.error("❌ More logs:", moreLogs);
-            } catch {}
-          }
-          throw e;
-       }
-    
+          const moreLogs = await e.getLogs(connection);
+          console.error("❌ More logs:", moreLogs);
+        } catch {}
+      }
+      throw e;
+    }
 
     console.log("✅ withdraw sent:", sig);
 

@@ -292,5 +292,6 @@ step 5:
 ### deposit/deposit1/deposit2/deposit3
 DEPOSIT_VARIANT=deposit npm run test:deposit
 
-npm run test:transfer
-npm run test:withdraw
+TRANSFER_VARIANT=transfer npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw npm run test:withdraw

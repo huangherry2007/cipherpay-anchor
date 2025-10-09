@@ -34,15 +34,23 @@ async function ensureAirdrop(connection: web3.Connection, pubkey: web3.PublicKey
 }
 const toNum = (x: any) => (typeof x === "number" ? x : Number(x?.toString?.() ?? x));
 
+// ── config ────────────────────────────────────────────────────────────────────
 const RPC_URL = process.env.SOLANA_URL || "http://127.0.0.1:8899";
 const CU_LIMIT = Number(process.env.CU_LIMIT ?? 800_000);
+
+// NEW: variant selector (defaults to 'transfer')
+const TRANSFER_VARIANT = (process.env.TRANSFER_VARIANT || "transfer").trim();
+
 const TREE_SEED = Buffer.from("tree");
 const ROOT_CACHE_SEED = Buffer.from("root_cache");
 const NULLIFIER_SEED = Buffer.from("nullifier");
 
+// proofs dir (override with env if desired)
 const buildDir = process.env.TRANSFER_BUILD_DIR ? path.resolve(process.env.TRANSFER_BUILD_DIR) : path.resolve("proofs");
-const proofPath = path.join(buildDir, "transfer_proof.bin");
-const publicsPath = path.join(buildDir, "transfer_public_signals.bin");
+
+// UPDATED: pick files based on TRANSFER_VARIANT (logic unchanged elsewhere)
+const proofPath = path.join(buildDir, `${TRANSFER_VARIANT}_proof.bin`);
+const publicsPath = path.join(buildDir, `${TRANSFER_VARIANT}_public_signals.bin`);
 
 const TRANSFER_IDX = { OUT1: 0, OUT2: 1, NULLIFIER: 2, MERKLE_ROOT: 3, NEW_ROOT1: 4, NEW_ROOT2: 5, NEW_NEXT_IDX: 6, ENC1: 7, ENC2: 8 } as const;
 
@@ -61,6 +69,7 @@ describe("shielded_transfer — assumes PDAs pre-initialized (no init here)", ()
   const payer = wallet.publicKey;
 
   console.log("🧭 programId:", programId.toBase58());
+  console.log("📁 using proof files:", { proofPath, publicsPath });
 
   let proofBytes: Buffer;
   let publicInputsBytes: Buffer;
@@ -108,6 +117,7 @@ describe("shielded_transfer — assumes PDAs pre-initialized (no init here)", ()
     const preNextIdx = toNum(treeBefore.nextIndex);
 
     // ⬇️ PASS A 32-BYTE BUFFER (IDL expects [u8; 32])
+    // IMPORTANT: keep the original argument order and logic
     const anchorIx = await program.methods
       .shieldedTransfer(nullifierBuf, proofBytes, publicInputsBytes)
       .accountsPartial({
@@ -157,7 +167,7 @@ describe("shielded_transfer — assumes PDAs pre-initialized (no init here)", ()
     const [nullifierRecordPda] = web3.PublicKey.findProgramAddressSync([NULLIFIER_SEED, nullifierBuf], programId);
     const cuIx = web3.ComputeBudgetProgram.setComputeUnitLimit({ units: CU_LIMIT });
 
-    // ⬇️ Buffer again
+    // ⬇️ Buffer again (keep order)
     const anchorIx = await program.methods
       .shieldedTransfer(nullifierBuf, proofBytes, publicInputsBytes)
       .accountsPartial({
