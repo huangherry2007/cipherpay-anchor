@@ -2,6 +2,10 @@
 
 A privacy-preserving payment protocol built on Solana using zero-knowledge proofs and Anchor framework.
 
+## Usage
+Please see tests/README.md
+
+
 ## 🎉 Phase 4 Complete!
 
 **Phase 4 has been successfully completed!** The CipherPay Anchor program is now fully functional, optimized, documented, and ready for deployment. 
