@@ -48,6 +48,15 @@ fn u32_le(x: &[u8; 32]) -> u32 {
     u32::from_le_bytes([x[0], x[1], x[2], x[3]])
 }
 
+/// Rebuild a 32-byte Solana pubkey from two 32-byte LE field limbs (< 2^128 each).
+/// We take the first 16 bytes (little-endian) of each limb: lo || hi.
+fn pubkey_from_limbs(lo32: &[u8; 32], hi32: &[u8; 32]) -> Pubkey {
+    let mut bytes = [0u8; 32];
+    bytes[0..16].copy_from_slice(&lo32[0..16]);
+    bytes[16..32].copy_from_slice(&hi32[0..16]);
+    Pubkey::new_from_array(bytes)
+}
+
 #[program]
 #[allow(deprecated)]
 pub mod cipherpay_anchor {
@@ -79,16 +88,22 @@ pub mod cipherpay_anchor {
             pub const ENC_NOTE1_HASH: usize = 7;
             pub const ENC_NOTE2_HASH: usize = 8;
         }
+        // UPDATED: withdraw publics now include recipient_owner limbs (slots 2,3)
+        // [ NULLIFIER(0), MERKLE_ROOT(1), RECIPIENT_OWNER_LO(2), RECIPIENT_OWNER_HI(3),
+        //   RECIPIENT_WALLET_PUBKEY(4), AMOUNT(5), TOKEN_ID(6) ]
         pub mod withdraw_idx {
             pub const NULLIFIER: usize = 0;
             pub const MERKLE_ROOT: usize = 1;
-            pub const RECIPIENT_WALLET_PUBKEY: usize = 2;
-            pub const AMOUNT: usize = 3;
-            pub const TOKEN_ID: usize = 4;
+            pub const RECIPIENT_OWNER_LO: usize = 2;   // NEW
+            pub const RECIPIENT_OWNER_HI: usize = 3;   // NEW
+            pub const RECIPIENT_WALLET_PUBKEY: usize = 4;
+            pub const AMOUNT: usize = 5;
+            pub const TOKEN_ID: usize = 6;
         }
     }
     #[cfg(not(feature = "real-crypto"))]
     use stub_idx::{deposit_idx, transfer_idx, withdraw_idx};
+
 
     pub fn initialize_vault(_ctx: Context<InitializeVault>) -> Result<()> {
         Ok(())
@@ -160,6 +175,8 @@ pub mod cipherpay_anchor {
             )?;
 
             // Single-history checks
+            msg!("Deposit: old_root: {:?}", old_root);
+            msg!("Deposit: tree.current_root: {:?}", ctx.accounts.tree.current_root);
             require!(old_root == ctx.accounts.tree.current_root, CipherPayError::OldRootMismatch);
             let sig_next = u32::from_le_bytes([new_next_leaf_index[0], new_next_leaf_index[1], new_next_leaf_index[2], new_next_leaf_index[3]]);
             require!(sig_next == ctx.accounts.tree.next_index + 1, CipherPayError::InvalidInput);
@@ -167,6 +184,7 @@ pub mod cipherpay_anchor {
             // State updates
             ctx.accounts.tree.current_root = new_root;
             ctx.accounts.tree.next_index   = sig_next;
+
 
             insert_merkle_root(&new_root, &mut ctx.accounts.root_cache);
 
@@ -248,6 +266,8 @@ pub mod cipherpay_anchor {
     
         // --- strict sync with on-chain tree history ---
         let tree = &mut ctx.accounts.tree;
+        msg!("Transfer: old_root: {:?}", old_root);
+        msg!("Transfer: tree.current_root: {:?}", tree.current_root);
         require!(old_root == tree.current_root, CipherPayError::OldRootMismatch);
     
         // transfer inserts two leaves → next_index must jump by 2
@@ -259,6 +279,7 @@ pub mod cipherpay_anchor {
         tree.next_index   = sig_next;
     
         // --- cache both intermediate roots (zero-copy) ---
+        msg!("inserting roots: {:?}, {:?}", new_root1, new_root2);
         insert_many_roots(&[new_root1, new_root2], &mut ctx.accounts.root_cache);
     
         emit!(TransferCompleted {
@@ -284,21 +305,21 @@ pub mod cipherpay_anchor {
         public_inputs_bytes: Vec<u8>,
     ) -> Result<()> {
         // -------------------- 0) Byte-size sanity (cheap, first) --------------------
-        require_eq!(
-            nullifier.len(),
-            32,
-            CipherPayError::InvalidInput
-        );
+        require_eq!(nullifier.len(), 32, CipherPayError::InvalidInput);
+    
         // Groth16 proof should be 256 bytes (a, b, c + padding) for BN254
         require_eq!(
             proof_bytes.len(),
             256,
             CipherPayError::InvalidProofBytesLength
         );
-        // Withdraw publics = 5 * 32 = 160 bytes
+    
+        // UPDATED: Withdraw publics = 7 * 32 = 224 bytes
+        // [0] nullifier, [1] root, [2] recip_owner_lo, [3] recip_owner_hi,
+        //  [4] recip_wallet_pk, [5] amount, [6] token_id
         require_eq!(
             public_inputs_bytes.len(),
-            5 * 32,
+            7 * 32,
             CipherPayError::InvalidPublicInputsLength
         );
     
@@ -309,21 +330,28 @@ pub mod cipherpay_anchor {
         let root32: &[u8; 32] = public_inputs_bytes[32..64]
             .try_into()
             .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
-        let _recipient_pk32: &[u8; 32] = public_inputs_bytes[64..96]
+    
+        // NEW: recipient owner limbs (LE 32B each, first 16B carry value)
+        let rec_owner_lo32: &[u8; 32] = public_inputs_bytes[64..96]
             .try_into()
             .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
-        let amount_fe32: &[u8; 32] = public_inputs_bytes[96..128]
+        let rec_owner_hi32: &[u8; 32] = public_inputs_bytes[96..128]
             .try_into()
             .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
-        let _token_id32: &[u8; 32] = public_inputs_bytes[128..160]
+    
+        // Shifted indices for the remaining items
+        let _recipient_pk32: &[u8; 32] = public_inputs_bytes[128..160]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+        let amount_fe32: &[u8; 32] = public_inputs_bytes[160..192]
+            .try_into()
+            .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
+        let _token_id32: &[u8; 32] = public_inputs_bytes[192..224]
             .try_into()
             .map_err(|_| error!(CipherPayError::InvalidPublicInputsLength))?;
     
         // Caller-provided nullifier must equal public input nullifier
-        require!(
-            nullifier.as_slice() == &nf32[..],
-            CipherPayError::NullifierMismatch
-        );
+        require!(nullifier.as_slice() == &nf32[..], CipherPayError::NullifierMismatch);
     
         // Parse u64 amount from first 8 bytes (little-endian) of the 32-byte field element
         let amount_u64 = {
@@ -331,8 +359,6 @@ pub mod cipherpay_anchor {
             tmp.copy_from_slice(&amount_fe32[0..8]);
             u64::from_le_bytes(tmp)
         };
-        // Optional sanity: require non-zero amount (up to you)
-        // require!(amount_u64 > 0, CipherPayError::InvalidWithdrawAmount);
     
         // -------------------- 1) Cheap state checks (before verifier) --------------------
         // Nullifier must not be used yet (idempotency)
@@ -369,6 +395,14 @@ pub mod cipherpay_anchor {
             CipherPayError::InvalidInput
         );
     
+        // NEW: Rebuild owner pubkey from limbs and bind to the passed account
+        let expected_owner = pubkey_from_limbs(rec_owner_lo32, rec_owner_hi32);
+        require_keys_eq!(
+            ctx.accounts.recipient_owner.key(),
+            expected_owner,
+            CipherPayError::InvalidInput
+        );
+    
         // -------------------- 2) Proof verification (after cheap guards) --------------------
         #[cfg(feature = "real-crypto")]
         {
@@ -380,16 +414,20 @@ pub mod cipherpay_anchor {
             let sigs = solana_verifier::parse_public_signals_exact(&public_inputs_bytes)
                 .map_err(|_| error!(CipherPayError::InvalidZkProof))?;
     
-            // Indices consistent with your circuit:
-            // 0:nullifier, 1:root, 2:recipient, 3:amount, 4:tokenId  (adjust if needed)
-            const NULLIFIER_IDX: usize = 0;
-            const ROOT_IDX: usize = 1;
-            const AMOUNT_IDX: usize = 3;
+            // UPDATED indices consistent with the circuit:
+            // 0:nullifier, 1:root, 2:owner_lo, 3:owner_hi, 4:recipient_pk, 5:amount, 6:tokenId
+            const NULLIFIER_IDX: usize       = 0;
+            const ROOT_IDX: usize            = 1;
+            const OWNER_LO_IDX: usize        = 2;
+            const OWNER_HI_IDX: usize        = 3;
+            const AMOUNT_IDX: usize          = 5;
     
-            require!(sigs[NULLIFIER_IDX] == *nf32, CipherPayError::InvalidZkProof);
-            require!(sigs[ROOT_IDX] == *root32, CipherPayError::InvalidZkProof);
+            require!(sigs[NULLIFIER_IDX] == *nf32,   CipherPayError::InvalidZkProof);
+            require!(sigs[ROOT_IDX]      == *root32, CipherPayError::InvalidZkProof);
+            require!(sigs[OWNER_LO_IDX]  == *rec_owner_lo32, CipherPayError::InvalidZkProof);
+            require!(sigs[OWNER_HI_IDX]  == *rec_owner_hi32, CipherPayError::InvalidZkProof);
     
-            // Optionally re-derive amount and compare first 8 bytes:
+            // Optional amount cross-check
             let amt_fe = sigs[AMOUNT_IDX];
             let mut amt_chk = [0u8; 8];
             amt_chk.copy_from_slice(&amt_fe[0..8]);
@@ -401,13 +439,11 @@ pub mod cipherpay_anchor {
     
         #[cfg(not(feature = "real-crypto"))]
         {
-            // Stub: we already parsed from public_inputs_bytes.
-            // Do nothing here—this preserves realistic amount & root for tests.
+            // Stub build: no zk verification, we already parsed/publicly checked values above.
         }
     
         // -------------------- 3) CPI: vault -> recipient (if amount > 0) --------------------
         if amount_u64 > 0 {
-            // signer seeds for vault_pda = [b"vault", [bump]]
             let vault_bump = ctx.bumps.vault_pda;
             let bump = [vault_bump];
             let signer_seeds: &[&[u8]] = &[VAULT_SEED, &bump];
@@ -444,4 +480,5 @@ pub mod cipherpay_anchor {
     
         Ok(())
     }
+   
 }

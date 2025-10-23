@@ -20,6 +20,11 @@ import {
   getOrCreateAssociatedTokenAccount,
   mintTo,
 } from "@solana/spl-token";
+import dotenv from "dotenv";
+dotenv.config();
+
+// 👇 NEW: helper to rebuild base58 from limbs
+import { limbsToRecipientOwnerBase58 } from "./recipientOwnerLimbs";
 
 // ---------- IDL helpers (same pattern as deposit/transfer) ----------
 type AnyIdl = Record<string, any>;
@@ -53,12 +58,19 @@ const KEYPAIR_PATH =
 // NEW: variant selector (defaults to 'withdraw')
 const WITHDRAW_VARIANT = (process.env.WITHDRAW_VARIANT || "withdraw").trim();
 
-// File paths now depend on WITHDRAW_VARIANT (logic unchanged)
+// File paths depend on WITHDRAW_VARIANT
 const PROOF_PATH = path.resolve(__dirname, `../proofs/${WITHDRAW_VARIANT}_proof.bin`);
 const PUBSIG_PATH = path.resolve(__dirname, `../proofs/${WITHDRAW_VARIANT}_public_signals.bin`);
 
-// Public signals layout (5 × 32): [nullifier, merkleRoot, recipientWalletPubKey, amount, tokenId]
-const PUBSIG_COUNT = 5;
+// ✅ UPDATED public signals layout (7 × 32):
+// [0] nullifier,
+// [1] merkleRoot,
+// [2] recipientOwner_lo,
+// [3] recipientOwner_hi,
+// [4] recipientWalletPubKey,
+// [5] amount,
+// [6] tokenId
+const PUBSIG_COUNT = 7;
 const FIELD_BYTES = 32;
 const PROOF_BYTES = 256;
 const PUBSIG_BYTES = PUBSIG_COUNT * FIELD_BYTES;
@@ -106,9 +118,11 @@ function loadWithdrawProofAndSignals() {
 
   const s0_nullifier = split32(publicSignals, 0);
   const s1_merkleRoot = split32(publicSignals, 1);
-  const s2_recipientWalletPubKey = split32(publicSignals, 2);
-  const s3_amount = split32(publicSignals, 3);
-  const s4_tokenId = split32(publicSignals, 4);
+  const s2_recipientOwner_lo = split32(publicSignals, 2);      // NEW
+  const s3_recipientOwner_hi = split32(publicSignals, 3);      // NEW
+  const s4_recipientWalletPubKey = split32(publicSignals, 4);
+  const s5_amount = split32(publicSignals, 5);                 // shifted (+1)
+  const s6_tokenId = split32(publicSignals, 6);                // shifted (+1)
 
   return {
     proof,
@@ -116,9 +130,11 @@ function loadWithdrawProofAndSignals() {
     fields: {
       nullifier: s0_nullifier,
       merkleRoot: s1_merkleRoot,
-      recipientWalletPubKey: s2_recipientWalletPubKey,
-      amount: s3_amount,
-      tokenId: s4_tokenId,
+      recipientOwner_lo: s2_recipientOwner_lo,                 // NEW
+      recipientOwner_hi: s3_recipientOwner_hi,                 // NEW
+      recipientWalletPubKey: s4_recipientWalletPubKey,
+      amount: s5_amount,
+      tokenId: s6_tokenId,
     },
   };
 }
@@ -184,8 +200,13 @@ describe("Shielded Withdraw - Real Program Integration", () => {
       true
     );
 
-    // 4) Recipient = test wallet
-    recipientOwner = provider.wallet.publicKey;
+    // 4) Recipient = test wallet (or ENV override to match proof)
+    const envRecipient = process.env.RECIPIENT_OWNER_SOL_B58;
+    console.log("envRecipient", envRecipient);
+    recipientOwner = envRecipient
+      ? new PublicKey(envRecipient)
+      : Keypair.generate().publicKey;
+    
     const recipientAta = await getOrCreateAssociatedTokenAccount(
       provider.connection,
       (provider.wallet as any).payer,
@@ -210,7 +231,6 @@ describe("Shielded Withdraw - Real Program Integration", () => {
       program.programId
     );
 
-    // initialize_root_cache(authority = payer)
     if ((program.methods as any).initializeRootCache) {
       try {
         await (program.methods as any)
@@ -244,11 +264,24 @@ describe("Shielded Withdraw - Real Program Integration", () => {
   it("Validates withdraw circuit outputs & sizes", async () => {
     const { proof, publicSignals } = loadWithdrawProofAndSignals();
     assert.equal(proof.length, PROOF_BYTES, "Groth16 proof should be 256 bytes");
-    assert.equal(publicSignals.length, PUBSIG_BYTES, "Withdraw public signals should be 160 bytes (5 × 32)");
+    assert.equal(publicSignals.length, PUBSIG_BYTES, "Withdraw public signals should be 224 bytes (7 × 32)");
   });
 
   it("Executes shielded withdraw with ZK proof verification", async () => {
     const { proof, publicSignals, fields } = loadWithdrawProofAndSignals();
+
+    // ✅ Rebuild base58 from limbs in public signals (LE → BigInt)
+    const lo = toBigIntLE(fields.recipientOwner_lo);
+    const hi = toBigIntLE(fields.recipientOwner_hi);
+    const recipientOwnerFromProofB58 = limbsToRecipientOwnerBase58(lo, hi);
+    const recipientOwnerFromProof = new PublicKey(recipientOwnerFromProofB58);
+
+    // Sanity: recipientOwner (proof) must equal our recipientOwner account
+    assert.strictEqual(
+      recipientOwnerFromProof.toBase58(),
+      recipientOwner.toBase58(),
+      "recipientOwner (from limbs) in public signals must equal recipientOwner account"
+    );
 
     // Ensure recipient ATA exists
     await getOrCreateAssociatedTokenAccount(

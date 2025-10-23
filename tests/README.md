@@ -2,6 +2,45 @@
 
 This directory contains a comprehensive test suite for the CipherPay Anchor program, including unit tests, integration tests, and performance benchmarks.
 
+# Usage
+### test procedures on localnet
+step 1: start "solana-test-validator --reset"
+step 2: anchor build -- --features real-crypto
+step 3: anchor deploy
+step 4:
+export CP_TREE_DEPTH=16
+export CP_HASH_VARIANT=poseidon
+export CP_GENESIS_ROOT=0x2a7c7c9b6ce5880b9f6f228d72bf6a575a526f29c66ecceef8b753d38bba7323
+
+ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 \
+ANCHOR_WALLET=~/.config/solana/id.json \
+anchor run init
+step 5: 
+### deposit/deposit1/deposit2/deposit3
+DEPOSIT_VARIANT=deposit npm run test:deposit
+
+TRANSFER_VARIANT=transfer npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw npm run test:withdraw
+
+DEPOSIT_VARIANT=deposit1 npm run test:deposit
+
+TRANSFER_VARIANT=transfer1 npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw1 npm run test:withdraw
+
+DEPOSIT_VARIANT=deposit2 npm run test:deposit
+
+TRANSFER_VARIANT=transfer2 npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw2 npm run test:withdraw
+
+DEPOSIT_VARIANT=deposit3 npm run test:deposit
+
+TRANSFER_VARIANT=transfer3 npm run test:transfer
+
+WITHDRAW_VARIANT=withdraw3 npm run test:withdraw
+
 ## Test Structure
 
 ### Test Modules
@@ -276,40 +315,3 @@ RUST_BACKTRACE=1 cargo test
 cargo test -- --test-threads=1
 ```
 
-### test procedures on localnet
-step 1: start "solana-test-validator --reset"
-step 2: anchor build -- --features real-crypto
-step 3: anchor deploy
-step 4:
-export CP_TREE_DEPTH=16
-export CP_HASH_VARIANT=poseidon
-export CP_GENESIS_ROOT=0x2a7c7c9b6ce5880b9f6f228d72bf6a575a526f29c66ecceef8b753d38bba7323
-
-ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 \
-ANCHOR_WALLET=~/.config/solana/id.json \
-anchor run init
-step 5: 
-### deposit/deposit1/deposit2/deposit3
-DEPOSIT_VARIANT=deposit npm run test:deposit
-
-TRANSFER_VARIANT=transfer npm run test:transfer
-
-WITHDRAW_VARIANT=withdraw npm run test:withdraw
-
-DEPOSIT_VARIANT=deposit1 npm run test:deposit
-
-TRANSFER_VARIANT=transfer1 npm run test:transfer
-
-WITHDRAW_VARIANT=withdraw1 npm run test:withdraw
-
-DEPOSIT_VARIANT=deposit2 npm run test:deposit
-
-TRANSFER_VARIANT=transfer2 npm run test:transfer
-
-WITHDRAW_VARIANT=withdraw2 npm run test:withdraw
-
-DEPOSIT_VARIANT=deposit3 npm run test:deposit
-
-TRANSFER_VARIANT=transfer3 npm run test:transfer
-
-WITHDRAW_VARIANT=withdraw3 npm run test:withdraw
