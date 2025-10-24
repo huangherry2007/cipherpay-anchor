@@ -35,7 +35,7 @@ pub const MAX_IC: usize = 64;
 // From compile logs (public inputs + public outputs)
 pub const DEPOSIT_N_PUBLIC: usize  = 7; // 3 in + 4 out
 pub const TRANSFER_N_PUBLIC: usize = 9; // 2 in + 7 out
-pub const WITHDRAW_N_PUBLIC: usize = 5; // 3 in + 2 out
+pub const WITHDRAW_N_PUBLIC: usize = 7; // 3 in + 4 out (owner limbs added)
 
 // ---- Public signal indices (adjust if your order differs) -------------------
 pub mod deposit_idx {
@@ -59,12 +59,21 @@ pub mod transfer_idx {
     pub const ENC_NOTE2_HASH:      usize = 8;
 }
 pub mod withdraw_idx {
-    // Order used in your withdraw public signals (5 x 32B LE limbs)
+    // UPDATED order (7 × 32B LE limbs)
+    // [0] nullifier
+    // [1] merkleRoot
+    // [2] recipientOwner_lo
+    // [3] recipientOwner_hi
+    // [4] recipientWalletPubKey
+    // [5] amount
+    // [6] tokenId
     pub const NULLIFIER: usize               = 0;
     pub const MERKLE_ROOT: usize             = 1;
-    pub const RECIPIENT_WALLET_PUBKEY: usize = 2;
-    pub const AMOUNT: usize                  = 3;
-    pub const TOKEN_ID: usize                = 4;
+    pub const RECIPIENT_OWNER_LO: usize      = 2;
+    pub const RECIPIENT_OWNER_HI: usize      = 3;
+    pub const RECIPIENT_WALLET_PUBKEY: usize = 4;
+    pub const AMOUNT: usize                  = 5;
+    pub const TOKEN_ID: usize                = 6;
 }
 
 // -------------------- Little helpers (LE/BE & math) -------------------------
