@@ -20,8 +20,13 @@ import {
   getOrCreateAssociatedTokenAccount,
   mintTo,
 } from "@solana/spl-token";
+import dotenv from "dotenv";
+dotenv.config();
 
-// ---------- IDL helpers (same pattern as deposit/transfer) ----------
+// helper to rebuild base58 from limbs
+import { limbsToRecipientOwnerBase58 } from "./recipientOwnerLimbs";
+
+// ---------- IDL helpers ----------
 type AnyIdl = Record<string, any>;
 function loadIdl(): AnyIdl {
   const IDL_PATH = path.resolve(__dirname, "../target/idl/cipherpay_anchor.json");
@@ -50,15 +55,22 @@ const KEYPAIR_PATH =
   process.env.ANCHOR_WALLET ||
   `${process.env.HOME}/.config/solana/id.json`;
 
-// NEW: variant selector (defaults to 'withdraw')
+// variant selector (defaults to 'withdraw')
 const WITHDRAW_VARIANT = (process.env.WITHDRAW_VARIANT || "withdraw").trim();
 
-// File paths now depend on WITHDRAW_VARIANT (logic unchanged)
+// file paths depend on WITHDRAW_VARIANT
 const PROOF_PATH = path.resolve(__dirname, `../proofs/${WITHDRAW_VARIANT}_proof.bin`);
 const PUBSIG_PATH = path.resolve(__dirname, `../proofs/${WITHDRAW_VARIANT}_public_signals.bin`);
 
-// Public signals layout (5 × 32): [nullifier, merkleRoot, recipientWalletPubKey, amount, tokenId]
-const PUBSIG_COUNT = 5;
+// UPDATED public signals layout (7 × 32):
+// [0] nullifier,
+// [1] merkleRoot,
+// [2] recipientOwner_lo,
+// [3] recipientOwner_hi,
+// [4] recipientWalletPubKey,
+// [5] amount,
+// [6] tokenId
+const PUBSIG_COUNT = 7;
 const FIELD_BYTES = 32;
 const PROOF_BYTES = 256;
 const PUBSIG_BYTES = PUBSIG_COUNT * FIELD_BYTES;
@@ -106,9 +118,11 @@ function loadWithdrawProofAndSignals() {
 
   const s0_nullifier = split32(publicSignals, 0);
   const s1_merkleRoot = split32(publicSignals, 1);
-  const s2_recipientWalletPubKey = split32(publicSignals, 2);
-  const s3_amount = split32(publicSignals, 3);
-  const s4_tokenId = split32(publicSignals, 4);
+  const s2_recipientOwner_lo = split32(publicSignals, 2);
+  const s3_recipientOwner_hi = split32(publicSignals, 3);
+  const s4_recipientWalletPubKey = split32(publicSignals, 4);
+  const s5_amount = split32(publicSignals, 5);
+  const s6_tokenId = split32(publicSignals, 6);
 
   return {
     proof,
@@ -116,9 +130,11 @@ function loadWithdrawProofAndSignals() {
     fields: {
       nullifier: s0_nullifier,
       merkleRoot: s1_merkleRoot,
-      recipientWalletPubKey: s2_recipientWalletPubKey,
-      amount: s3_amount,
-      tokenId: s4_tokenId,
+      recipientOwner_lo: s2_recipientOwner_lo,
+      recipientOwner_hi: s3_recipientOwner_hi,
+      recipientWalletPubKey: s4_recipientWalletPubKey,
+      amount: s5_amount,
+      tokenId: s6_tokenId,
     },
   };
 }
@@ -184,8 +200,22 @@ describe("Shielded Withdraw - Real Program Integration", () => {
       true
     );
 
-    // 4) Recipient = test wallet
-    recipientOwner = provider.wallet.publicKey;
+    // 4) Load signals first to derive *authoritative* recipient owner from limbs
+    const { fields } = loadWithdrawProofAndSignals();
+
+    const lo = toBigIntLE(fields.recipientOwner_lo);
+    const hi = toBigIntLE(fields.recipientOwner_hi);
+    const ownerFromProofB58 = limbsToRecipientOwnerBase58(lo, hi);
+    const ownerFromProof = new PublicKey(ownerFromProofB58);
+
+    const envRecipient = process.env.RECIPIENT_OWNER_SOL_B58;
+    if (envRecipient && envRecipient !== ownerFromProof.toBase58()) {
+      console.warn(
+        `RECIPIENT_OWNER_SOL_B58 (${envRecipient}) does not match proof owner (${ownerFromProof.toBase58()}); using proof owner.`
+      );
+    }
+    recipientOwner = ownerFromProof;
+
     const recipientAta = await getOrCreateAssociatedTokenAccount(
       provider.connection,
       (provider.wallet as any).payer,
@@ -194,9 +224,7 @@ describe("Shielded Withdraw - Real Program Integration", () => {
     );
     recipientTokenAccount = recipientAta.address;
 
-    // 5) Load signals: derive nullifier PDA + amount
-    const { fields } = loadWithdrawProofAndSignals();
-
+    // 5) Derive nullifier PDA + amount
     [nullifierRecord] = PublicKey.findProgramAddressSync(
       [Buffer.from("nullifier"), Buffer.from(fields.nullifier)],
       program.programId
@@ -210,7 +238,6 @@ describe("Shielded Withdraw - Real Program Integration", () => {
       program.programId
     );
 
-    // initialize_root_cache(authority = payer)
     if ((program.methods as any).initializeRootCache) {
       try {
         await (program.methods as any)
@@ -244,13 +271,13 @@ describe("Shielded Withdraw - Real Program Integration", () => {
   it("Validates withdraw circuit outputs & sizes", async () => {
     const { proof, publicSignals } = loadWithdrawProofAndSignals();
     assert.equal(proof.length, PROOF_BYTES, "Groth16 proof should be 256 bytes");
-    assert.equal(publicSignals.length, PUBSIG_BYTES, "Withdraw public signals should be 160 bytes (5 × 32)");
+    assert.equal(publicSignals.length, PUBSIG_BYTES, "Withdraw public signals should be 224 bytes (7 × 32)");
   });
 
   it("Executes shielded withdraw with ZK proof verification", async () => {
     const { proof, publicSignals, fields } = loadWithdrawProofAndSignals();
 
-    // Ensure recipient ATA exists
+    // Ensure recipient ATA exists (already ensured in beforeAll, but safe)
     await getOrCreateAssociatedTokenAccount(
       provider.connection,
       (provider.wallet as any).payer,
@@ -295,7 +322,6 @@ describe("Shielded Withdraw - Real Program Integration", () => {
     const postRecipient = await getAccount(provider.connection, recipientTokenAccount);
     const postAmount = Number(postRecipient.amount);
 
-    // This will only pass if the root in publicSignals exists in root_cache.
     assert.equal(
       postAmount,
       preAmount + withdrawAmount,

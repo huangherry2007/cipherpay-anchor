@@ -7,9 +7,21 @@
     "build": "anchor build -- --features real-crypto",
     "deploy": "anchor deploy",
     "test": "anchor test",
-    "test:deposit": "jest tests/deposit.ts --runInBand",
-    "test:transfer": "jest tests/transfer.ts --runInBand",
-    "test:withdraw": "jest tests/withdraw.ts --runInBand"
+    "test:deposit": "DEPOSIT_VARIANT=deposit jest tests/deposit.ts --runInBand",
+    "test:deposit1": "DEPOSIT_VARIANT=deposit1 jest tests/deposit.ts --runInBand",
+    "test:deposit2": "DEPOSIT_VARIANT=deposit2 jest tests/deposit.ts --runInBand",
+    "test:deposit3": "DEPOSIT_VARIANT=deposit3 jest tests/deposit.ts --runInBand",
+    "test:transfer": "TRANSFER_VARIANT=transfer jest tests/transfer.ts --runInBand",
+    "test:transfer1": "TRANSFER_VARIANT=transfer1 jest tests/transfer.ts --runInBand",
+    "test:transfer2": "TRANSFER_VARIANT=transfer2 jest tests/transfer.ts --runInBand",
+    "test:transfer3": "TRANSFER_VARIANT=transfer3 jest tests/transfer.ts --runInBand",
+    "test:withdraw": "WITHDRAW_VARIANT=withdraw jest tests/withdraw.ts --runInBand",
+    "test:withdraw1": "WITHDRAW_VARIANT=withdraw1 jest tests/withdraw.ts --runInBand",
+    "test:withdraw2": "WITHDRAW_VARIANT=withdraw2 jest tests/withdraw.ts --runInBand",
+    "test:withdraw3": "WITHDRAW_VARIANT=withdraw3 jest tests/withdraw.ts --runInBand",
+    "test:deposit0": "jest tests/deposit.ts --runInBand",
+    "test:transfer0": "jest tests/transfer.ts --runInBand",
+    "test:withdraw0": "jest tests/withdraw.ts --runInBand"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",
@@ -17,9 +29,11 @@
     "@solana/spl-token": "^0.3.9",
     "@solana/web3.js": "^1.87.0",
     "chai": "^4.3.0",
+    "dotenv": "^16.3.1",
     "snarkit2": "^0.2.0"
   },
   "devDependencies": {
+    "@types/bs58": "^4.0.4",
     "@types/chai": "^4.3.0",
     "@types/jest": "^30.0.0",
     "@types/mocha": "^10.0.0",
